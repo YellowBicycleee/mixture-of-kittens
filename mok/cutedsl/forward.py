@@ -18,7 +18,7 @@ import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint16
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from .forward_contract import (
@@ -249,22 +249,57 @@ class _CombineKernel:
         flat_index: Int64,
         value: BFloat16,
     ):
+        # CuTe DSL 4.6.2 rejects FP/BF16 system-scope ExtStore payloads.
+        # Store the identical 16-bit representation through an integer view.
+        bits = value.bitcast(Uint16)
         if peer_rank == Int32(0):
-            cute.arch.store(peers[0] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[0], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(1):
-            cute.arch.store(peers[1] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[1], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(2):
-            cute.arch.store(peers[2] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[2], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(3):
-            cute.arch.store(peers[3] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[3], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(4):
-            cute.arch.store(peers[4] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[4], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(5):
-            cute.arch.store(peers[5] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[5], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         elif peer_rank == Int32(6):
-            cute.arch.store(peers[6] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[6], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
         else:
-            cute.arch.store(peers[7] + flat_index, value, scope="sys")
+            cute.arch.store(
+                cute.recast_ptr(peers[7], dtype=Uint16) + flat_index,
+                bits,
+                scope="sys",
+            )
 
     @cute.kernel
     def kernel(
