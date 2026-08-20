@@ -363,7 +363,9 @@ def main() -> None:
             ).cpu().tolist()
             schedule_ok = (
                 num_tokens == 4 * MACROBATCH_SIZE
-                and real_routes == EP_SIZE * NUM_LOCAL_TOKENS * TOPK
+                # This process is one destination EP rank, so uniform
+                # routing contributes 1 / EP_SIZE of the global routes.
+                and real_routes == NUM_LOCAL_TOKENS * TOPK
                 and padding_rows == num_tokens - real_routes
                 and bool(torch.all(schedule.tokens_per_expert == 256).item())
                 and peer_counts == [NUM_LOCAL_TOKENS * TOPK // EP_SIZE] * EP_SIZE
