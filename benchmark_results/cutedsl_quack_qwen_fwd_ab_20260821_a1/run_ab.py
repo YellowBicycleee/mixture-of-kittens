@@ -28,16 +28,19 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import torch
+import torch.distributed as dist
+
+# Load the wheel-installed package before exposing archive-only benchmark/test
+# helpers.  The compiled mok._C extension lives in this venv package, not in
+# the clean git-archive source tree used by sbatch.sh.
+from mok import functional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import torch
-import torch.distributed as dist
-
 from benchmarks.utils import get_tflops, init_distributed
-from mok import functional
 from tests.utils import (
     BF16_TOLERANCE,
     generate_inputs,
@@ -337,6 +340,13 @@ def make_case(
 
 
 def main() -> None:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    cache_root = os.environ.get("MOK_CUTEDSL_CACHE_ROOT")
+    if cache_root:
+        rank_cache = Path(cache_root).resolve() / f"rank-{local_rank}"
+        rank_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["CUTE_DSL_CACHE_DIR"] = str(rank_cache)
+
     rank, world_size, device = init_distributed()
     if world_size != EP_SIZE:
         raise RuntimeError(f"runner requires EP{EP_SIZE}; got EP{world_size}")
@@ -353,7 +363,7 @@ def main() -> None:
     try:
         with torch.no_grad():
             cases = [
-                make_case(tokens, rank, int(os.environ["LOCAL_RANK"]), device)
+                make_case(tokens, rank, local_rank, device)
                 for tokens in (CORRECTNESS_TOKENS, TIMING_TOKENS)
             ]
         payload = {
