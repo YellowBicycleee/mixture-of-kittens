@@ -19,7 +19,7 @@ umask 022
 
 readonly BUNDLE=benchmark_results/cutedsl_qwen_fwd_b300_correctness_20260821_a1
 readonly IMAGE='nvcr.io#nvidia/pytorch:26.05-py3'
-readonly CUTEDSL_SPEC='nvidia-cutlass-dsl[cu13]==4.6.2'
+readonly QUACK_SPEC='quack-kernels[cu13]==0.6.4'
 readonly EXPECTED_TK_HEAD=1c3920d993404dd49a6d4c7267ea11d583bd5c68
 
 inside_container() {
@@ -57,7 +57,7 @@ inside_container() {
 
   python -m venv --system-site-packages "${venv_dir}"
   "${venv_dir}/bin/python" -m pip install \
-    --disable-pip-version-check --no-input --force-reinstall "${CUTEDSL_SPEC}"
+    --disable-pip-version-check --no-input "${QUACK_SPEC}"
   env MOK_ARCH=SM103 "${venv_dir}/bin/python" -m pip install \
     --disable-pip-version-check --no-input --no-deps --no-build-isolation \
     --force-reinstall "${source_dir}"
@@ -66,6 +66,7 @@ import importlib.metadata
 import torch
 
 assert importlib.metadata.version("nvidia-cutlass-dsl") == "4.6.2"
+assert importlib.metadata.version("quack-kernels") == "0.6.4"
 assert importlib.metadata.version("mixture-of-kittens") == "0.1.0"
 assert torch.cuda.device_count() == 8
 for index in range(8):

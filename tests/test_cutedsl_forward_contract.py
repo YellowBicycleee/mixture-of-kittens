@@ -32,6 +32,30 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
         self.assertEqual(contract.decode_schedule_entry(7, route_idx), (37, route_idx))
         self.assertIsNone(contract.decode_schedule_entry(-1, 0x5A5A5A5A))
 
+    def test_macro_local_cu_seqlens_skew_and_zero_experts(self) -> None:
+        # The macro starts inside expert 0, crosses a zero-row expert, consumes
+        # all of expert 2, and ends inside expert 3.
+        self.assertEqual(
+            contract.macro_local_cu_seqlens([10, 0, 4, 8], 8, 8),
+            (0, 2, 2, 6, 8),
+        )
+
+    def test_macro_local_cu_seqlens_single_expert_spans_macro(self) -> None:
+        self.assertEqual(
+            contract.macro_local_cu_seqlens([20, 0, 5], 8, 8),
+            (0, 8, 8, 8),
+        )
+
+    def test_macro_local_cu_seqlens_partial_tail(self) -> None:
+        self.assertEqual(
+            contract.macro_local_cu_seqlens([3, 0, 7, 2], 8, 4),
+            (0, 0, 0, 2, 4),
+        )
+
+    def test_macro_local_cu_seqlens_rejects_out_of_range_macro(self) -> None:
+        with self.assertRaisesRegex(ValueError, "extends past"):
+            contract.macro_local_cu_seqlens([3, 5], 4, 8)
+
     def test_fixed_qwen_contract(self) -> None:
         contract.validate_fixed_forward_contract(
             ep_size=8,

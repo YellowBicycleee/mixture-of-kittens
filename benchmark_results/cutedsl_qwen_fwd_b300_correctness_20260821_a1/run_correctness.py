@@ -518,6 +518,7 @@ def main() -> None:
                     "nvidia_cutlass_dsl": importlib.metadata.version(
                         "nvidia-cutlass-dsl"
                     ),
+                    "quack_kernels": importlib.metadata.version("quack-kernels"),
                 },
                 "device": torch.cuda.get_device_name(device),
                 "config": {

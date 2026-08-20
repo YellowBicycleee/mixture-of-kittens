@@ -38,6 +38,37 @@ def macro_offsets(num_tokens: int, macrobatch_size: int) -> tuple[int, ...]:
     return tuple(range(last, -1, -macrobatch_size))
 
 
+def macro_local_cu_seqlens(
+    tokens_per_expert: Sequence[int],
+    macro_offset: int,
+    macro_rows: int,
+) -> tuple[int, ...]:
+    """Return QuACK varlen-M boundaries for one slice of MoK's expert rows.
+
+    The schedule concatenates padded expert rows globally.  If ``S[e]`` is
+    the exclusive prefix of ``tokens_per_expert``, macro ``[o, o + R)`` owns
+    the local boundary ``clamp(S[e] - o, 0, R)``.  Repeated boundaries are
+    intentional: they encode experts with no rows in this macro.
+    """
+
+    if type(macro_offset) is not int or macro_offset < 0:
+        raise ValueError("macro_offset must be a non-negative integer")
+    if type(macro_rows) is not int or macro_rows <= 0:
+        raise ValueError("macro_rows must be a positive integer")
+
+    boundaries = [0]
+    prefix = 0
+    for count in tokens_per_expert:
+        if type(count) is not int or count < 0:
+            raise ValueError("tokens_per_expert must contain non-negative integers")
+        prefix += count
+        boundaries.append(min(max(prefix - macro_offset, 0), macro_rows))
+
+    if prefix < macro_offset + macro_rows:
+        raise ValueError("macro extends past the scheduled expert rows")
+    return tuple(boundaries)
+
+
 def decode_schedule_entry(peer_rank: int, route_idx: int) -> tuple[int, int] | None:
     """Decode one scheduler row into ``(source_token, return_route)``.
 

@@ -1,11 +1,11 @@
-"""Correctness-first CuTe DSL forward for the fixed Qwen BF16/EP8 target.
+"""CuTe DSL forward with QuACK Tensor Core GEMMs for Qwen BF16/EP8.
 
-This is a real sister backend: dispatch, both expert MLPs, SwiGLU, and combine
-are CuTe DSL device kernels.  The GEMMs intentionally use a thin scalar
-implementation for the first end-to-end correctness gate.  This version has
-no valid performance claim (``N/A``): it synchronously reads ``num_tokens``
-once and does not yet use Blackwell grouped Tensor Core GEMMs.  The existing
-CUDA C++ megakernel remains MoK's default backend.
+MoK owns the CuTe DSL dispatch, SwiGLU, and combine kernels and keeps its
+reverse macro order and nine-tensor ABI.  QuACK 0.6.4 supplies the dense and
+variable-M ``tcgen05`` GEMMs.  The existing CUDA C++ megakernel remains MoK's
+default backend.  This revision still reads ``num_tokens`` to the host once,
+so its performance result remains ``N/A`` until that synchronization is
+removed and the full backend is measured.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from .forward_contract import (
     macro_offsets,
     validate_fixed_forward_contract,
 )
+from .quack_gemm import routed_gemm, shared_gemm
 
 
 THREADS = 256
@@ -45,9 +46,12 @@ class _DispatchKernel:
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
         num_tokens: cute.Tensor,
+        tokens_per_expert: cute.Tensor,
+        macro_cu_seqlens: cute.Tensor,
         x_routed: cute.Tensor,
         num_peer_tokens: cutlass.Constexpr,
         macro_offset: cutlass.Constexpr,
+        macro_rows: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         peer_layout = cute.make_layout((num_peer_tokens * HIDDEN_SIZE,))
@@ -60,8 +64,11 @@ class _DispatchKernel:
             schedule_peer_rank,
             schedule_peer_token_idx,
             num_tokens,
+            tokens_per_expert,
+            macro_cu_seqlens,
             x_routed,
             macro_offset,
+            macro_rows,
             total_elements,
         ).launch(
             grid=((total_elements + THREADS - 1) // THREADS, 1, 1),
@@ -102,11 +109,27 @@ class _DispatchKernel:
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
         num_tokens: cute.Tensor,
+        tokens_per_expert: cute.Tensor,
+        macro_cu_seqlens: cute.Tensor,
         x_routed: cute.Tensor,
         macro_offset: cutlass.Constexpr,
+        macro_rows: cutlass.Constexpr,
         total_elements: cutlass.Constexpr,
     ):
-        linear = cute.arch.block_idx()[0] * Int32(THREADS) + cute.arch.thread_idx()[0]
+        block = cute.arch.block_idx()[0]
+        thread = cute.arch.thread_idx()[0]
+        linear = block * Int32(THREADS) + thread
+        if block == Int32(0) and thread == Int32(0):
+            # If S[e] is the global exclusive expert prefix, QuACK needs
+            # clamp(S[e] - macro_offset, 0, macro_rows) for this macro.
+            prefix = Int32(0)
+            macro_cu_seqlens[0] = Int32(0)
+            for expert in cutlass.range_constexpr(NUM_LOCAL_EXPERTS):
+                prefix = prefix + tokens_per_expert[expert]
+                local_end = prefix - Int32(macro_offset)
+                local_end = cutlass.max(Int32(0), local_end)
+                local_end = cutlass.min(Int32(macro_rows), local_end)
+                macro_cu_seqlens[expert + 1] = local_end
         if linear < Int32(total_elements):
             local_row = linear // Int32(HIDDEN_SIZE)
             column = linear - local_row * Int32(HIDDEN_SIZE)
@@ -126,120 +149,6 @@ class _DispatchKernel:
                     # The 256-aligned expert padding has peer_rank == -1 and
                     # an undefined token index.  Never read the latter.
                     x_routed[local_row, column] = BFloat16(0.0)
-
-
-class _SharedGemmKernel:
-    """Straightforward BF16 x BF16 -> BF16 CuTe DSL GEMM."""
-
-    def __init__(self, reduction_size: int):
-        self.reduction_size = reduction_size
-
-    @cute.jit
-    def __call__(
-        self,
-        activations: cute.Tensor,
-        weights: cute.Tensor,
-        output: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        total_elements = cute.size(output)
-        self.kernel(activations, weights, output, total_elements).launch(
-            grid=((total_elements + THREADS - 1) // THREADS, 1, 1),
-            block=(THREADS, 1, 1),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        activations: cute.Tensor,
-        weights: cute.Tensor,
-        output: cute.Tensor,
-        total_elements: cutlass.Constexpr,
-    ):
-        linear = cute.arch.block_idx()[0] * Int32(THREADS) + cute.arch.thread_idx()[0]
-        if linear < Int32(total_elements):
-            output_columns = output.shape[1]
-            row = linear // output_columns
-            column = linear - row * output_columns
-            accumulator = Float32(0.0)
-            for reduction_idx in cutlass.range(
-                0, self.reduction_size, 1, unroll=1
-            ):
-                lhs = Float32(activations[row, reduction_idx])
-                rhs = Float32(weights[column, reduction_idx])
-                accumulator = accumulator + lhs * rhs
-            output[row, column] = accumulator.to(BFloat16)
-
-
-class _RoutedGemmKernel:
-    """Grouped GEMM over the scheduler's contiguous expert segments."""
-
-    def __init__(self, reduction_size: int):
-        self.reduction_size = reduction_size
-
-    @cute.jit
-    def __call__(
-        self,
-        activations: cute.Tensor,
-        weights: cute.Tensor,
-        output: cute.Tensor,
-        num_tokens: cute.Tensor,
-        tokens_per_expert: cute.Tensor,
-        macro_offset: cutlass.Constexpr,
-        stream: cuda.CUstream,
-    ):
-        total_elements = cute.size(output)
-        self.kernel(
-            activations,
-            weights,
-            output,
-            num_tokens,
-            tokens_per_expert,
-            macro_offset,
-            total_elements,
-        ).launch(
-            grid=((total_elements + THREADS - 1) // THREADS, 1, 1),
-            block=(THREADS, 1, 1),
-            stream=stream,
-        )
-
-    @cute.jit
-    def _find_expert(self, global_row: Int32, tokens_per_expert: cute.Tensor):
-        expert = Int32(0)
-        expert_end = tokens_per_expert[0]
-        while global_row >= expert_end and expert < Int32(NUM_LOCAL_EXPERTS - 1):
-            expert = expert + Int32(1)
-            expert_end = expert_end + tokens_per_expert[expert]
-        return expert
-
-    @cute.kernel
-    def kernel(
-        self,
-        activations: cute.Tensor,
-        weights: cute.Tensor,
-        output: cute.Tensor,
-        num_tokens: cute.Tensor,
-        tokens_per_expert: cute.Tensor,
-        macro_offset: cutlass.Constexpr,
-        total_elements: cutlass.Constexpr,
-    ):
-        linear = cute.arch.block_idx()[0] * Int32(THREADS) + cute.arch.thread_idx()[0]
-        if linear < Int32(total_elements):
-            output_columns = output.shape[1]
-            local_row = linear // output_columns
-            column = linear - local_row * output_columns
-            global_row = local_row + Int32(macro_offset)
-            if global_row < num_tokens[0]:
-                expert = self._find_expert(global_row, tokens_per_expert)
-                accumulator = Float32(0.0)
-                for reduction_idx in cutlass.range(
-                    0, self.reduction_size, 1, unroll=1
-                ):
-                    lhs = Float32(activations[local_row, reduction_idx])
-                    rhs = Float32(weights[expert, column, reduction_idx])
-                    accumulator = accumulator + lhs * rhs
-                output[local_row, column] = accumulator.to(BFloat16)
 
 
 class _SwiGLUKernel:
@@ -391,10 +300,6 @@ class _CombineKernel:
 
 
 _DISPATCH = _DispatchKernel()
-_SHARED_GATE_UP = _SharedGemmKernel(HIDDEN_SIZE)
-_SHARED_DOWN = _SharedGemmKernel(INTERMEDIATE_SIZE)
-_ROUTED_GATE_UP = _RoutedGemmKernel(HIDDEN_SIZE)
-_ROUTED_DOWN = _RoutedGemmKernel(INTERMEDIATE_SIZE)
 _SWIGLU = _SwiGLUKernel()
 _COMBINE = _CombineKernel()
 
@@ -506,12 +411,15 @@ def forward_bf16(
     hidden_routed = torch.empty((m, INTERMEDIATE_SIZE), dtype=torch.bfloat16, device=device)
     y_shared = torch.empty((t, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
     y_routed = torch.empty((m, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    macro_cu_seqlens = torch.empty(
+        (NUM_LOCAL_EXPERTS + 1,), dtype=torch.int32, device=device
+    )
 
-    cute_x = from_dlpack(workspace.x_buffer, assumed_align=16)
     cute_schedule_rank = from_dlpack(schedule.peer_rank, assumed_align=16)
     cute_schedule_route = from_dlpack(schedule.peer_token_idx, assumed_align=16)
     cute_num_tokens = from_dlpack(schedule.num_tokens, assumed_align=16)
     cute_tokens_per_expert = from_dlpack(schedule.tokens_per_expert, assumed_align=16)
+    cute_macro_cu_seqlens = from_dlpack(macro_cu_seqlens, assumed_align=16)
     cute_x_routed = from_dlpack(x_routed, assumed_align=16)
     cute_gate_shared = from_dlpack(gate_shared, assumed_align=16)
     cute_gate_routed = from_dlpack(gate_routed, assumed_align=16)
@@ -519,59 +427,50 @@ def forward_bf16(
     cute_up_routed = from_dlpack(up_routed, assumed_align=16)
     cute_hidden_shared = from_dlpack(hidden_shared, assumed_align=16)
     cute_hidden_routed = from_dlpack(hidden_routed, assumed_align=16)
-    cute_y_shared = from_dlpack(y_shared, assumed_align=16)
     cute_y_routed = from_dlpack(y_routed, assumed_align=16)
 
-    cute_shared_gate_weights = from_dlpack(shared_gate_weights, assumed_align=16)
-    cute_routed_gate_weights = from_dlpack(routed_gate_weights, assumed_align=16)
-    cute_shared_up_weights = from_dlpack(shared_up_weights, assumed_align=16)
-    cute_routed_up_weights = from_dlpack(routed_up_weights, assumed_align=16)
-    cute_shared_down_weights = from_dlpack(shared_down_weights, assumed_align=16)
-    cute_routed_down_weights = from_dlpack(routed_down_weights, assumed_align=16)
     stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
     # Shared expert is independent of the routed schedule.
-    _SHARED_GATE_UP(cute_x, cute_shared_gate_weights, cute_gate_shared, stream)
-    _SHARED_GATE_UP(cute_x, cute_shared_up_weights, cute_up_shared, stream)
+    shared_gemm(workspace.x_buffer, shared_gate_weights, gate_shared)
+    shared_gemm(workspace.x_buffer, shared_up_weights, up_shared)
     _SWIGLU(cute_gate_shared, cute_up_shared, cute_hidden_shared, None, 0, stream)
-    _SHARED_DOWN(cute_hidden_shared, cute_shared_down_weights, cute_y_shared, stream)
+    shared_gemm(hidden_shared, shared_down_weights, y_shared)
 
     x_ptrs = _bf16_ptrs(workspace.x_buffer_ptrs)
     combine_ptrs = _bf16_ptrs(workspace.combine_buffer_ptrs)
-    # Correctness-first bring-up reads the device scalar once so we launch only
-    # real macros instead of the larger capacity envelope.  This D2H sync is
-    # why timing for this revision is explicitly N/A.
+    # Read the device scalar once so we launch only real macros instead of the
+    # larger capacity envelope.  Removing this D2H sync is separate follow-up
+    # work; the GEMMs here are already Blackwell Tensor Core kernels.
     routed_num_tokens = int(schedule.num_tokens.item())
     if not 0 <= routed_num_tokens <= workspace.schedule_capacity:
         raise RuntimeError("schedule.num_tokens exceeds the schedule capacity")
     for macro_offset in macro_offsets(routed_num_tokens, m):
+        macro_rows = min(m, routed_num_tokens - macro_offset)
         _DISPATCH(
             x_ptrs,
             cute_schedule_rank,
             cute_schedule_route,
             cute_num_tokens,
+            cute_tokens_per_expert,
+            cute_macro_cu_seqlens,
             cute_x_routed,
             t,
             macro_offset,
+            macro_rows,
             stream,
         )
-        _ROUTED_GATE_UP(
-            cute_x_routed,
-            cute_routed_gate_weights,
-            cute_gate_routed,
-            cute_num_tokens,
-            cute_tokens_per_expert,
-            macro_offset,
-            stream,
+        routed_gemm(
+            x_routed[:macro_rows],
+            routed_gate_weights,
+            gate_routed[:macro_rows],
+            macro_cu_seqlens,
         )
-        _ROUTED_GATE_UP(
-            cute_x_routed,
-            cute_routed_up_weights,
-            cute_up_routed,
-            cute_num_tokens,
-            cute_tokens_per_expert,
-            macro_offset,
-            stream,
+        routed_gemm(
+            x_routed[:macro_rows],
+            routed_up_weights,
+            up_routed[:macro_rows],
+            macro_cu_seqlens,
         )
         _SWIGLU(
             cute_gate_routed,
@@ -581,14 +480,11 @@ def forward_bf16(
             macro_offset,
             stream,
         )
-        _ROUTED_DOWN(
-            cute_hidden_routed,
-            cute_routed_down_weights,
-            cute_y_routed,
-            cute_num_tokens,
-            cute_tokens_per_expert,
-            macro_offset,
-            stream,
+        routed_gemm(
+            hidden_routed[:macro_rows],
+            routed_down_weights,
+            y_routed[:macro_rows],
+            macro_cu_seqlens,
         )
         _COMBINE(
             combine_ptrs,
