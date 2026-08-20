@@ -27,6 +27,7 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    fwd_backend: str = "cuda"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,8 @@ def validate_workspace_args(
     Outputs:
         None
     """
+    if config.fwd_backend not in ("cuda", "cutedsl"):
+        raise ValueError("fwd_backend must be 'cuda' or 'cutedsl'")
     if (
         type(config.schedule_capacity_multiplier) not in (int, float)
         or not math.isfinite(config.schedule_capacity_multiplier)
@@ -373,6 +376,8 @@ def build_schedule(
         raise TypeError("workspace must be a MoKWorkspace")
     if not isinstance(config, MoKConfig):
         raise TypeError("config must be a MoKConfig")
+    if config.fwd_backend not in ("cuda", "cutedsl"):
+        raise ValueError("fwd_backend must be 'cuda' or 'cutedsl'")
     device_properties = torch.cuda.get_device_properties(workspace.device)
     if type(config.fwd_num_comm_sms) is not int or config.fwd_num_comm_sms <= 0:
         raise ValueError("fwd_num_comm_sms must be a positive integer")
@@ -453,6 +458,8 @@ def validate_inputs(
     """
     if not isinstance(config, MoKConfig):
         raise TypeError("config must be a MoKConfig")
+    if config.fwd_backend not in ("cuda", "cutedsl"):
+        raise ValueError("fwd_backend must be 'cuda' or 'cutedsl'")
     if not isinstance(workspace, MoKWorkspace):
         raise TypeError("workspace must be a MoKWorkspace")
     if not isinstance(schedule, MoKSchedule):
@@ -515,6 +522,9 @@ def forward(
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
 
+    if config.fwd_backend == "cutedsl" and isinstance(routed_gate_weights, tuple):
+        raise NotImplementedError("CuTe DSL forward currently supports BF16 routed weights only")
+
     if isinstance(routed_gate_weights, tuple):
         routed_gate_weights_fp8, routed_gate_weights_sc = routed_gate_weights
         routed_up_weights_fp8, routed_up_weights_sc = routed_up_weights
@@ -544,18 +554,40 @@ def forward(
             hidden_routed=(hidden_fp8_t_routed, hidden_sc_t_routed),
         )
     else:
-        (x_routed, gate_shared, gate_routed, up_shared, up_routed,
-         hidden_shared, hidden_routed, y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd_bf16(
-            workspace.x_buffer, workspace.x_buffer_ptrs,
-            workspace.combine_buffer, workspace.combine_buffer_ptrs,
-            shared_gate_weights, routed_gate_weights,
-            shared_up_weights, routed_up_weights,
-            shared_down_weights, routed_down_weights,
-            schedule.peer_rank, schedule.peer_token_idx,
-            schedule.num_tokens, schedule.tokens_per_expert,
-            workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
-        )
+        if config.fwd_backend == "cuda":
+            (x_routed, gate_shared, gate_routed, up_shared, up_routed,
+             hidden_shared, hidden_routed, y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd_bf16(
+                workspace.x_buffer, workspace.x_buffer_ptrs,
+                workspace.combine_buffer, workspace.combine_buffer_ptrs,
+                shared_gate_weights, routed_gate_weights,
+                shared_up_weights, routed_up_weights,
+                shared_down_weights, routed_down_weights,
+                schedule.peer_rank, schedule.peer_token_idx,
+                schedule.num_tokens, schedule.tokens_per_expert,
+                workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
+                config.macrobatch_size, config.minibatch_size,
+            )
+        elif config.fwd_backend == "cutedsl":
+            # Keep CUTLASS optional and the established CUDA megakernel import
+            # path untouched.  The sister backend is loaded only when selected.
+            from .cutedsl.forward import forward_bf16 as cutedsl_forward_bf16
+
+            (x_routed, gate_shared, gate_routed, up_shared, up_routed,
+             hidden_shared, hidden_routed, y_shared, y_routed) = cutedsl_forward_bf16(
+                workspace,
+                schedule,
+                shared_gate_weights,
+                routed_gate_weights,
+                shared_up_weights,
+                routed_up_weights,
+                shared_down_weights,
+                routed_down_weights,
+                macrobatch_size=config.macrobatch_size,
+                minibatch_size=config.minibatch_size,
+                swiglu_limit=swiglu_limit,
+            )
+        else:
+            raise ValueError("fwd_backend must be 'cuda' or 'cutedsl'")
         forward_context = MoKForwardContext(
             x_routed=x_routed,
             gate_shared=gate_shared,
