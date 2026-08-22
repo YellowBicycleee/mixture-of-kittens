@@ -183,7 +183,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
             // Shared Gate + Up + SwiGLU (BF16). Shared preactivations are
             // retained because shared-expert backward does not replay them.
             const int task_idx = compute_cluster_idx;
-            expert_gate_up_swiglu_kernel<
+            expert_gate_up_swiglu_ep8_tuned_kernel<
                 true, IS_CLAMPED, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>(
                 g.x_shared, g.w_shared_gate, g.w_shared_up,
                 nullptr, nullptr, nullptr,
@@ -229,7 +229,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                 const int task_idx = minibatch_task_idx;
                 auto run_routed_gate_up = [&](auto load_depth) {
                     constexpr int LOAD_PIPE_DEPTH = decltype(load_depth)::value;
-                    expert_gate_up_swiglu_kernel<
+                    expert_gate_up_swiglu_ep8_tuned_kernel<
                         false, IS_CLAMPED, LOAD_PIPE_DEPTH>(
                         g.x_fp8_routed, g.w_routed_gate, g.w_routed_up,
                         &g.x_sc_routed, &g.w_routed_gate_sc, &g.w_routed_up_sc,

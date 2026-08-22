@@ -21,8 +21,11 @@ static_assert(
         + FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH
     <= 16);
 
+// This topology is tuned and benchmarked for EP8.  It remains instantiable for
+// the other supported world sizes so the generic functional matrix is kept,
+// but no performance claim is implied outside EP8.
 template <bool IS_SHARED, bool IS_CLAMPED, int LOAD_PIPE_DEPTH>
-static __device__ __forceinline__ void expert_gate_up_swiglu_kernel(
+static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     const std::conditional_t<IS_SHARED, mlp_bf16_gl, routed_activation_gl> &a_gmem,
     const std::conditional_t<IS_SHARED, weight_bf16_gl, routed_weight_gl> &gate_b_gmem,
     const std::conditional_t<IS_SHARED, weight_bf16_gl, routed_weight_gl> &up_b_gmem,
