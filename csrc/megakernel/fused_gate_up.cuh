@@ -9,22 +9,13 @@
 // Gate/Up round trip.
 
 static constexpr int FUSED_GATE_UP_Nb = config::MLP_Nb / config::CLUSTER_SIZE;
-static constexpr int FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH = 4;
-static constexpr int FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH = 3;
+static constexpr int FUSED_GATE_UP_LOAD_PIPE_DEPTH = 4;
 static_assert(config::CLUSTER_SIZE == 2);
 static_assert(FUSED_GATE_UP_Nb == config::SWIGLU_Nb);
 static_assert(config::MLP_Nb == 2 * config::SWIGLU_Nb);
-static_assert(FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
-static_assert(FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
-static_assert(
-    config::MLP_LOAD_PIPE_DEPTH + 1
-        + FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH
-    <= 16);
+static_assert(FUSED_GATE_UP_LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
 
-// This topology is tuned and benchmarked for EP8.  It remains instantiable for
-// the other supported world sizes so the generic functional matrix is kept,
-// but no performance claim is implied outside EP8.
-template <bool IS_SHARED, bool IS_CLAMPED, int LOAD_PIPE_DEPTH>
+template <bool IS_SHARED, bool IS_CLAMPED>
 static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     const std::conditional_t<IS_SHARED, mlp_bf16_gl, routed_activation_gl> &a_gmem,
     const std::conditional_t<IS_SHARED, weight_bf16_gl, routed_weight_gl> &gate_b_gmem,
@@ -65,112 +56,70 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     const uint64_t smem_base_addr
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
-    static constexpr bool SAVE_ROUTED_MXFP8_CONTEXT =
-        USE_ROUTED_MXFP8
-        && LOAD_PIPE_DEPTH == FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH;
-    static_assert(
-        LOAD_PIPE_DEPTH == FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH
-        || (USE_ROUTED_MXFP8
-            && LOAD_PIPE_DEPTH == FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH));
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     using b_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     constexpr int MLP_Kb = USE_ROUTED_MXFP8 ? config::MLP_FP8_Kb : config::MLP_BF16_Kb;
 
-    auto (&a_smem)[LOAD_PIPE_DEPTH] =
-        *reinterpret_cast<a_tile (*)[LOAD_PIPE_DEPTH]>(smem_base_addr);
-    auto (&b_smem)[LOAD_PIPE_DEPTH] =
-        *reinterpret_cast<b_tile (*)[LOAD_PIPE_DEPTH]>(
+    auto (&a_smem)[FUSED_GATE_UP_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<a_tile (*)[FUSED_GATE_UP_LOAD_PIPE_DEPTH]>(smem_base_addr);
+    auto (&b_smem)[FUSED_GATE_UP_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<b_tile (*)[FUSED_GATE_UP_LOAD_PIPE_DEPTH]>(
             smem_base_addr + sizeof(a_smem));
-    auto (&a_sc_smem)[LOAD_PIPE_DEPTH] =
-        *reinterpret_cast<mlp_sc_tile (*)[LOAD_PIPE_DEPTH]>(
+    auto (&a_sc_smem)[FUSED_GATE_UP_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<mlp_sc_tile (*)[FUSED_GATE_UP_LOAD_PIPE_DEPTH]>(
             smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
-    auto (&b_sc_smem)[LOAD_PIPE_DEPTH][2] =
-        *reinterpret_cast<mlp_sc_tile (*)[LOAD_PIPE_DEPTH][2]>(
+    auto (&b_sc_smem)[FUSED_GATE_UP_LOAD_PIPE_DEPTH][2] =
+        *reinterpret_cast<mlp_sc_tile (*)[FUSED_GATE_UP_LOAD_PIPE_DEPTH][2]>(
             smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem));
 
-    // The active task's scratch is disjoint from its input ring.  Macro-0
-    // routed MXFP8 uses the compact three-stage ring to make room for three
-    // independent q/sc pairs: Gate context, Up context, and hidden normal.
-    // All other paths retain V3a's four-stage ring and one-q footprint.
+    // Scratch is disjoint from the four-stage input ring.  Routed MXFP8 keeps
+    // one BF16 hidden tile plus independent Gate, Up, and hidden-normal q
+    // buffers; shared/routed-BF16 retain the V2.1 Gate/Up raw layout.
     static constexpr uint64_t FUSED_GATE_UP_RING_BYTES =
         sizeof(a_smem) + sizeof(b_smem)
         + sizeof(a_sc_smem) + sizeof(b_sc_smem);
+    static_assert(FUSED_GATE_UP_RING_BYTES % 1024 == 0);
     const uint64_t scratch_base_addr =
         smem_base_addr + FUSED_GATE_UP_RING_BYTES;
 
-    static constexpr uint64_t GATE_RAW_OFFSET = 0;
-    static constexpr uint64_t UP_RAW_OFFSET =
-        GATE_RAW_OFFSET + sizeof(quant_bf16_tile);
-    static constexpr uint64_t GATE_Q_FP8_OFFSET =
-        UP_RAW_OFFSET + sizeof(quant_bf16_tile);
-    static constexpr uint64_t GATE_Q_SC_OFFSET =
-        GATE_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
-    static constexpr uint64_t UP_Q_FP8_OFFSET =
-        GATE_Q_SC_OFFSET + sizeof(quant_sc_tile);
-    static constexpr uint64_t UP_Q_SC_OFFSET =
-        UP_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
-    static constexpr uint64_t HIDDEN_Q_FP8_OFFSET =
-        UP_Q_SC_OFFSET + sizeof(quant_sc_tile);
-    static constexpr uint64_t HIDDEN_Q_SC_OFFSET =
-        HIDDEN_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
-    static constexpr uint64_t ROUTED_MXFP8_SCRATCH_BYTES =
-        HIDDEN_Q_SC_OFFSET + sizeof(quant_sc_tile);
-    static constexpr uint64_t V3A_SCRATCH_BYTES =
-        GATE_Q_SC_OFFSET + sizeof(quant_sc_tile);
+    static constexpr uint64_t ROUTED_HIDDEN_BF16_OFFSET = 0;
+    static constexpr uint64_t ROUTED_GATE_Q_FP8_OFFSET =
+        ROUTED_HIDDEN_BF16_OFFSET + sizeof(quant_bf16_tile);
+    static constexpr uint64_t ROUTED_UP_Q_FP8_OFFSET =
+        ROUTED_GATE_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
+    static constexpr uint64_t ROUTED_HIDDEN_Q_FP8_OFFSET =
+        ROUTED_UP_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
+    static constexpr uint64_t ROUTED_GATE_Q_SC_OFFSET =
+        ROUTED_HIDDEN_Q_FP8_OFFSET + sizeof(quant_fp8_tile);
+    static constexpr uint64_t ROUTED_UP_Q_SC_OFFSET =
+        ROUTED_GATE_Q_SC_OFFSET + sizeof(quant_sc_tile);
+    static constexpr uint64_t ROUTED_HIDDEN_Q_SC_OFFSET =
+        ROUTED_UP_Q_SC_OFFSET + sizeof(quant_sc_tile);
+    static constexpr uint64_t ROUTED_SCRATCH_BYTES =
+        ROUTED_HIDDEN_Q_SC_OFFSET + sizeof(quant_sc_tile);
+    static constexpr uint64_t BF16_SCRATCH_BYTES =
+        2 * sizeof(quant_bf16_tile)
+        + sizeof(quant_fp8_tile) + sizeof(quant_sc_tile);
     static constexpr uint64_t ACTIVE_SCRATCH_BYTES =
-        SAVE_ROUTED_MXFP8_CONTEXT
-            ? ROUTED_MXFP8_SCRATCH_BYTES
-            : V3A_SCRATCH_BYTES;
+        USE_ROUTED_MXFP8 ? ROUTED_SCRATCH_BYTES : BF16_SCRATCH_BYTES;
 
-    auto &gate_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
-        scratch_base_addr + GATE_RAW_OFFSET);
+    auto &gate_raw_smem = *reinterpret_cast<quant_bf16_tile *>(scratch_base_addr);
     auto &up_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
-        scratch_base_addr + UP_RAW_OFFSET);
+        scratch_base_addr + sizeof(gate_raw_smem));
+    auto &hidden_bf16_smem = *reinterpret_cast<quant_bf16_tile *>(
+        scratch_base_addr + ROUTED_HIDDEN_BF16_OFFSET);
     auto &gate_q_fp8_smem = *reinterpret_cast<quant_fp8_tile *>(
-        scratch_base_addr + GATE_Q_FP8_OFFSET);
+        scratch_base_addr + ROUTED_GATE_Q_FP8_OFFSET);
     auto &gate_q_sc_smem = *reinterpret_cast<quant_sc_tile *>(
-        scratch_base_addr + GATE_Q_SC_OFFSET);
-    // Compile-time-dead extra-q aliases collapse onto Gate q in V3a paths, so
-    // every constructed SMEM reference remains inside ACTIVE_SCRATCH_BYTES.
+        scratch_base_addr + ROUTED_GATE_Q_SC_OFFSET);
     auto &up_q_fp8_smem = *reinterpret_cast<quant_fp8_tile *>(
-        scratch_base_addr
-        + (SAVE_ROUTED_MXFP8_CONTEXT ? UP_Q_FP8_OFFSET : GATE_Q_FP8_OFFSET));
+        scratch_base_addr + ROUTED_UP_Q_FP8_OFFSET);
     auto &up_q_sc_smem = *reinterpret_cast<quant_sc_tile *>(
-        scratch_base_addr
-        + (SAVE_ROUTED_MXFP8_CONTEXT ? UP_Q_SC_OFFSET : GATE_Q_SC_OFFSET));
+        scratch_base_addr + ROUTED_UP_Q_SC_OFFSET);
     auto &hidden_q_fp8_smem = *reinterpret_cast<quant_fp8_tile *>(
-        scratch_base_addr
-        + (SAVE_ROUTED_MXFP8_CONTEXT ? HIDDEN_Q_FP8_OFFSET : GATE_Q_FP8_OFFSET));
+        scratch_base_addr + ROUTED_HIDDEN_Q_FP8_OFFSET);
     auto &hidden_q_sc_smem = *reinterpret_cast<quant_sc_tile *>(
-        scratch_base_addr
-        + (SAVE_ROUTED_MXFP8_CONTEXT ? HIDDEN_Q_SC_OFFSET : GATE_Q_SC_OFFSET));
-
-    // Keep every TMA shared-memory operand on a 128-byte boundary.  The kernel
-    // base is 1024-byte aligned and the compact ring ends at +102912.
-    static_assert(sizeof(a_smem) % 128 == 0);
-    static_assert((sizeof(a_smem) + sizeof(b_smem)) % 128 == 0);
-    static_assert(
-        (sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem)) % 128 == 0);
-    static_assert(FUSED_GATE_UP_RING_BYTES % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + GATE_RAW_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + UP_RAW_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + GATE_Q_FP8_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + GATE_Q_SC_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + UP_Q_FP8_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + UP_Q_SC_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + HIDDEN_Q_FP8_OFFSET) % 128 == 0);
-    static_assert((FUSED_GATE_UP_RING_BYTES + HIDDEN_Q_SC_OFFSET) % 128 == 0);
-    static_assert(V3A_SCRATCH_BYTES == 82432);
-    static_assert(!SAVE_ROUTED_MXFP8_CONTEXT || FUSED_GATE_UP_RING_BYTES == 102912);
-    static_assert(!SAVE_ROUTED_MXFP8_CONTEXT || ROUTED_MXFP8_SCRATCH_BYTES == 116224);
-    static_assert(
-        !SAVE_ROUTED_MXFP8_CONTEXT
-        || FUSED_GATE_UP_RING_BYTES + ROUTED_MXFP8_SCRATCH_BYTES == 219136);
-    static_assert(
-        SAVE_ROUTED_MXFP8_CONTEXT || FUSED_GATE_UP_RING_BYTES == 137216);
-    static_assert(
-        SAVE_ROUTED_MXFP8_CONTEXT
-        || FUSED_GATE_UP_RING_BYTES + V3A_SCRATCH_BYTES == 219648);
+        scratch_base_addr + ROUTED_HIDDEN_Q_SC_OFFSET);
     static_assert(
         FUSED_GATE_UP_RING_BYTES + ACTIVE_SCRATCH_BYTES + 1023
         <= config::DYNAMIC_SHARED_MEMORY);
@@ -262,7 +211,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                         gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                 }
                 update_phasebit<1>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<FUSED_GATE_UP_LOAD_PIPE_DEPTH>(input_ring);
             }
         } else if (warpgroup::warpid() == 2 && warp::elect_leader()) {
             if constexpr (USE_ROUTED_MXFP8) {
@@ -288,7 +237,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                             gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                     }
                     update_phasebit<1>(gemm_bitfield, input_ring);
-                    input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
+                    input_ring = ring_advance<FUSED_GATE_UP_LOAD_PIPE_DEPTH>(input_ring);
                 }
             }
         } else if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
@@ -307,17 +256,6 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                                          config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring));
                     update_phasebit<0>(gemm_bitfield,
                                        config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring);
-                    // The compact ring can revisit a TMEM scale slot before
-                    // the prior MMA has consumed it.  Waiting for the next
-                    // A/B tile establishes a transitive dependency through
-                    // the input producer's gemm_inputs_finished wait.
-                    if constexpr (LOAD_PIPE_DEPTH == FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH) {
-                        tma::expect_bytes(
-                            gemm_inputs_arrived[input_ring],
-                            config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
-                        wait(gemm_inputs_arrived[input_ring],
-                             get_phasebit<0>(gemm_bitfield, input_ring));
-                    }
                     auto a_sc_tt_subtile =
                         a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16);
                     auto b_sc_tt_subtile_0 =
@@ -329,13 +267,11 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                     load_mxnv_scale_async2(
                         b_sc_tt_subtile_1, b_sc_smem[input_ring][1],
                         gemm_scales_finished[input_ring]);
-                    if constexpr (LOAD_PIPE_DEPTH != FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH) {
-                        tma::expect_bytes(
-                            gemm_inputs_arrived[input_ring],
-                            config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
-                        wait(gemm_inputs_arrived[input_ring],
-                             get_phasebit<0>(gemm_bitfield, input_ring));
-                    }
+                    tma::expect_bytes(
+                        gemm_inputs_arrived[input_ring],
+                        config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                    wait(gemm_inputs_arrived[input_ring],
+                         get_phasebit<0>(gemm_bitfield, input_ring));
                     if (idx == 0) {
                         mm2_ABt(
                             d_tt, a_smem[input_ring], b_smem[input_ring],
@@ -363,7 +299,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                                  gemm_inputs_finished[input_ring]);
                 }
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<FUSED_GATE_UP_LOAD_PIPE_DEPTH>(input_ring);
             }
             detail::tcgen05::commit<config::CLUSTER_SIZE>(gemm_outputs_arrived);
         }
@@ -373,95 +309,295 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
              get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
 
-        // Materialize the accumulator once in BF16 SMEM.  This matches the
-        // old HBM-separated path's BF16 rounding point before SwiGLU.
         const int tile_row = epilogue_group::laneid();
-        #pragma unroll 1
-        for (int block = 0; block < config::MLP_Nb / 32; ++block) {
-            float2 tmp[16];
-            asm volatile(R"(
-                tcgen05.ld.sync.aligned.32x32b.x32.b32
-                {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
-                 %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
-                )"
-                : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
-                  "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
-                  "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
-                  "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
-                  "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
-                  "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
-                  "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
-                  "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
-                : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16) + block * 32));
-            tensor_load_wait();
-
-            bf16_2 d_reg[16];
-            #pragma unroll
-            for (int j = 0; j < 16; ++j)
-                d_reg[j] = __float22bfloat162_rn(tmp[j]);
-            const uint32_t gate_addr =
-                static_cast<uint32_t>(__cvta_generic_to_shared(&gate_raw_smem));
-            const uint32_t up_addr =
-                static_cast<uint32_t>(__cvta_generic_to_shared(&up_raw_smem));
-            const uint32_t dst_addr = block < 4 ? gate_addr : up_addr;
-            const int dst_col = (block & 3) * 32;
-            const uint32_t *d_words = reinterpret_cast<const uint32_t *>(d_reg);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                move<float4>::sts(
-                    quant_bf16_tile::idx(dst_addr, {tile_row, dst_col + j * 8}),
-                    float4{
-                        __uint_as_float(d_words[j * 4]),
-                        __uint_as_float(d_words[j * 4 + 1]),
-                        __uint_as_float(d_words[j * 4 + 2]),
-                        __uint_as_float(d_words[j * 4 + 3]),
-                    });
-            }
-        }
-        tensor_before_thread_sync();
-        epilogue_group::sync(1);
-        warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
-
         const bool save_context = IS_SHARED || macrobatch_idx == 0;
         const int output_row = tile_coord.x * config::CLUSTER_SIZE + cta_rank;
-
-        // Routed MXFP8 macro 0 owns independent Gate/Up q sources.  Issue
-        // both context streams before SwiGLU so their TMA source reads can
-        // overlap the activation.  The depth-4 routed instantiation is the
-        // macro>0 fast path and compiles this entire context block away.
         if constexpr (USE_ROUTED_MXFP8) {
-            if constexpr (SAVE_ROUTED_MXFP8_CONTEXT) {
-                mxfp8::quantize_tile<
-                    true, false, config::SWIGLU_Nb, false, false, false>(
-                    gate_raw_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem, nullptr,
-                    epilogue_group::laneid(), 1);
+            // Load Gate/Up as four 32-column pairs.  Gate is retained in the
+            // hidden tile; each Up block stays in registers for its SwiGLU.
+            // Macro 0 rereads Up after issuing context stores, while later
+            // macrobatches remain single-pass.  Both preserve the original
+            // F32-to-BF16 rounding point without two full BF16 raw tiles.
+            const uint32_t hidden_bf16_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&hidden_bf16_smem));
+            const uint32_t gate_q_fp8_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&gate_q_fp8_smem));
+            const uint32_t gate_q_sc_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&gate_q_sc_smem));
+            const uint32_t up_q_fp8_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&up_q_fp8_smem));
+            const uint32_t up_q_sc_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&up_q_sc_smem));
+
+            auto load_tmem_bf16_block = [&](const int block, bf16_2 (&values)[16]) {
+                float2 tmp[16];
+                asm volatile(R"(
+                    tcgen05.ld.sync.aligned.32x32b.x32.b32
+                    {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
+                     %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
+                    )"
+                    : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
+                      "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
+                      "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
+                      "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
+                      "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
+                      "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
+                      "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
+                      "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
+                    : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16)
+                          + block * 32));
+                tensor_load_wait();
+                #pragma unroll
+                for (int j = 0; j < 16; ++j)
+                    values[j] = __float22bfloat162_rn(tmp[j]);
+            };
+
+            auto store_hidden_block = [&](const bf16_2 (&values)[16], const int block) {
+                const uint32_t *words = reinterpret_cast<const uint32_t *>(values);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    move<float4>::sts(
+                        quant_bf16_tile::idx(
+                            hidden_bf16_addr, {tile_row, block * 32 + j * 8}),
+                        float4{
+                            __uint_as_float(words[j * 4]),
+                            __uint_as_float(words[j * 4 + 1]),
+                            __uint_as_float(words[j * 4 + 2]),
+                            __uint_as_float(words[j * 4 + 3]),
+                        });
+                }
+            };
+
+            auto quantize_context_block = [&] (
+                const bf16_2 (&values)[16], const uint32_t fp8_addr,
+                const int block, uint32_t &scale_word
+            ) {
+                uint32_t values_fp8[8];
+                uint32_t scale_byte;
+                mxfp8::quantize_single_block(values, values_fp8, scale_byte);
+                scale_word |= scale_byte << (block * 8);
+                #pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    move<float4>::sts(
+                        quant_fp8_tile::idx(
+                            fp8_addr, {tile_row, block * 32 + k * 16}),
+                        float4{
+                            __uint_as_float(values_fp8[k * 4]),
+                            __uint_as_float(values_fp8[k * 4 + 1]),
+                            __uint_as_float(values_fp8[k * 4 + 2]),
+                            __uint_as_float(values_fp8[k * 4 + 3]),
+                        });
+                }
+            };
+
+            auto swiglu_block = [&](bf16_2 (&up_values)[16], const int block) {
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    bf16_2 gate_bf16;
+                    move<bf16_2>::lds(
+                        gate_bf16,
+                        quant_bf16_tile::idx(
+                            hidden_bf16_addr, {tile_row, block * 32 + j * 2}));
+                    float2 gate = __bfloat1622float2(gate_bf16);
+                    float2 up = __bfloat1622float2(up_values[j]);
+                    if constexpr (IS_CLAMPED) {
+                        gate = {
+                            fminf(gate.x, swiglu_limit),
+                            fminf(gate.y, swiglu_limit),
+                        };
+                        up = {
+                            fminf(fmaxf(up.x, -swiglu_limit), swiglu_limit),
+                            fminf(fmaxf(up.y, -swiglu_limit), swiglu_limit),
+                        };
+                    }
+                    float2 denominator = base_ops::mul::op<float2>(
+                        gate, float2{-1.0f, -1.0f});
+                    denominator = base_ops::exp::op<float2>(denominator);
+                    denominator = base_ops::sum::op<float2>(
+                        denominator, float2{1.0f, 1.0f});
+                    gate = base_ops::div::op<float2>(gate, denominator);
+                    gate = base_ops::mul::op<float2>(gate, up);
+                    up_values[j] = __floats2bfloat162_rn(gate.x, gate.y);
+                }
+                store_hidden_block(up_values, block);
+            };
+
+            if (save_context) {
+                uint32_t gate_scale_word = 0;
+                uint32_t up_scale_word = 0;
+                // Macro 0 first pass: materialize Gate in hidden scratch and
+                // build both independent context q/sc sources.  Up is loaded
+                // again below, avoiding a full-tile register lifetime.
+                #pragma unroll 1
+                for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
+                    bf16_2 values[16];
+                    load_tmem_bf16_block(block, values);
+                    quantize_context_block(
+                        values, gate_q_fp8_addr, block, gate_scale_word);
+                    store_hidden_block(values, block);
+
+                    load_tmem_bf16_block(
+                        block + config::SWIGLU_Nb / 32, values);
+                    quantize_context_block(
+                        values, up_q_fp8_addr, block, up_scale_word);
+                }
+
+                const uint32_t scale_offset =
+                    (tile_row % 32) * 16 + (tile_row / 32) * 4;
+                move<int>::sts(
+                    gate_q_sc_addr + scale_offset,
+                    std::bit_cast<int>(gate_scale_word));
+                move<int>::sts(
+                    up_q_sc_addr + scale_offset,
+                    std::bit_cast<int>(up_scale_word));
+
+                // Publish every q/sc source before the elected lane issues
+                // both context streams.  TMEM remains live for the Up reread.
+                tensor_before_thread_sync();
                 epilogue_group::sync(1);
                 if (epilogue_group::laneid() == 0) {
                     tma::store_async(gate_context_gmem, gate_q_fp8_smem,
                                      {output_row, tile_coord.y});
                     tma::store_async(*gate_context_sc_gmem, gate_q_sc_smem,
                                      {output_row, tile_coord.y, 0, 0});
-                }
-
-                mxfp8::quantize_tile<
-                    true, false, config::SWIGLU_Nb, false, false, false>(
-                    up_raw_smem,
-                    up_q_fp8_smem, up_q_sc_smem,
-                    up_q_fp8_smem, up_q_sc_smem, nullptr,
-                    epilogue_group::laneid(), 1);
-                epilogue_group::sync(1);
-                if (epilogue_group::laneid() == 0) {
                     tma::store_async(up_context_gmem, up_q_fp8_smem,
                                      {output_row, tile_coord.y});
                     tma::store_async(*up_context_sc_gmem, up_q_sc_smem,
                                      {output_row, tile_coord.y, 0, 0});
                 }
+                // All epilogue warps enter SwiGLU only after both context
+                // payload/scale streams have been issued.
+                epilogue_group::sync(1);
+
+                // The context stores now overlap the second-pass Up loads and
+                // SwiGLU.  Release TMEM immediately after the final Up block
+                // reaches registers, before computing that block.
+                #pragma unroll 1
+                for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
+                    bf16_2 up_values[16];
+                    load_tmem_bf16_block(
+                        block + config::SWIGLU_Nb / 32, up_values);
+                    if (block == config::SWIGLU_Nb / 32 - 1) {
+                        tensor_before_thread_sync();
+                        epilogue_group::sync(1);
+                        warpgroup::tma::cluster::arrive(
+                            gemm_outputs_finished, 0);
+                    }
+                    swiglu_block(up_values, block);
+                }
+            } else {
+                // Macro > 0 keeps V3b's single-pass path: no context is saved,
+                // so rereading Up would provide no overlap benefit.
+                #pragma unroll 1
+                for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
+                    bf16_2 values[16];
+                    load_tmem_bf16_block(block, values);
+                    store_hidden_block(values, block);
+
+                    load_tmem_bf16_block(
+                        block + config::SWIGLU_Nb / 32, values);
+                    if (block == config::SWIGLU_Nb / 32 - 1) {
+                        tensor_before_thread_sync();
+                        epilogue_group::sync(1);
+                        warpgroup::tma::cluster::arrive(
+                            gemm_outputs_finished, 0);
+                    }
+                    swiglu_block(values, block);
+                }
+            }
+
+            mxfp8::quantize_tile<
+                true, false, config::SWIGLU_Nb, false, false, false>(
+                hidden_bf16_smem,
+                hidden_q_fp8_smem, hidden_q_sc_smem,
+                hidden_q_fp8_smem, hidden_q_sc_smem, nullptr,
+                epilogue_group::laneid(), 1);
+
+            if (save_context && epilogue_group::laneid() == 0)
+                tma::store_async_read_wait();
+            // Context q/sc cannot be overwritten for hidden transpose until
+            // the elected lane has observed source-read completion.  This
+            // sync also publishes every hidden BF16 row for the transposed
+            // quantization pass.
+            epilogue_group::sync(1);
+
+            if (save_context) {
+                mxfp8::quantize_tile<
+                    false, true, config::SWIGLU_Nb, false, false, false>(
+                    hidden_bf16_smem,
+                    gate_q_fp8_smem, gate_q_sc_smem,
+                    gate_q_fp8_smem, gate_q_sc_smem, nullptr,
+                    epilogue_group::laneid(), 1);
+                epilogue_group::sync(1);
+            }
+
+            if (epilogue_group::laneid() == 0) {
+                tma::store_async(hidden_gmem, hidden_q_fp8_smem,
+                                 {output_row, tile_coord.y});
+                tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
+                                 {output_row, tile_coord.y, 0, 0});
+                if (save_context) {
+                    tma::store_async(*hidden_t_gmem, gate_q_fp8_smem,
+                                     {tile_coord.y, output_row});
+                    tma::store_async(*hidden_sc_t_gmem, gate_q_sc_smem,
+                                     {tile_coord.y, output_row, 0, 0});
+                }
+                tma::store_async_wait();
+                barrier_arrive(
+                    hidden_row_block_ready,
+                    hidden_row_block_ready_base_index
+                        + macrobatch_row_block_offset + tile_coord.x);
             }
         } else {
-            // Shared Gate/Up are always saved; routed BF16 saves macro 0.  The
-            // read wait makes Gate safe for the in-place hidden overwrite.
+            // V2.1 shared/routed-BF16 path: materialize Gate and Up, save the
+            // required context, then overwrite Gate with hidden.
+            #pragma unroll 1
+            for (int block = 0; block < config::MLP_Nb / 32; ++block) {
+                float2 tmp[16];
+                asm volatile(R"(
+                    tcgen05.ld.sync.aligned.32x32b.x32.b32
+                    {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
+                     %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
+                    )"
+                    : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
+                      "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
+                      "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
+                      "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
+                      "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
+                      "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
+                      "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
+                      "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
+                    : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16)
+                          + block * 32));
+                tensor_load_wait();
+
+                bf16_2 d_reg[16];
+                #pragma unroll
+                for (int j = 0; j < 16; ++j)
+                    d_reg[j] = __float22bfloat162_rn(tmp[j]);
+                const uint32_t gate_addr =
+                    static_cast<uint32_t>(__cvta_generic_to_shared(&gate_raw_smem));
+                const uint32_t up_addr =
+                    static_cast<uint32_t>(__cvta_generic_to_shared(&up_raw_smem));
+                const uint32_t dst_addr = block < 4 ? gate_addr : up_addr;
+                const int dst_col = (block & 3) * 32;
+                const uint32_t *d_words = reinterpret_cast<const uint32_t *>(d_reg);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    move<float4>::sts(
+                        quant_bf16_tile::idx(dst_addr, {tile_row, dst_col + j * 8}),
+                        float4{
+                            __uint_as_float(d_words[j * 4]),
+                            __uint_as_float(d_words[j * 4 + 1]),
+                            __uint_as_float(d_words[j * 4 + 2]),
+                            __uint_as_float(d_words[j * 4 + 3]),
+                        });
+                }
+            }
+            tensor_before_thread_sync();
+            epilogue_group::sync(1);
+            warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+
             if (save_context) {
                 if (epilogue_group::laneid() == 0) {
                     tma::store_async(gate_context_gmem, gate_raw_smem,
@@ -472,106 +608,40 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 }
                 epilogue_group::sync(1);
             }
-        }
 
-        // Apply SwiGLU in place: each thread reads one Gate/Up pair and
-        // overwrites exactly the corresponding Gate pair with hidden.
-        const auto *gate_pairs =
-            reinterpret_cast<const bf16_2 *>(gate_raw_smem.data);
-        const auto *up_pairs =
-            reinterpret_cast<const bf16_2 *>(up_raw_smem.data);
-        auto *hidden_pairs = reinterpret_cast<bf16_2 *>(gate_raw_smem.data);
-        constexpr int NUM_PAIRS = config::SWIGLU_Mb * config::SWIGLU_Nb / 2;
-        constexpr int EPILOGUE_THREADS = WARPGROUP_WARPS * WARP_THREADS;
-        #pragma unroll 1
-        for (int i = epilogue_group::laneid(); i < NUM_PAIRS;
-             i += EPILOGUE_THREADS) {
-            float2 gate = __bfloat1622float2(gate_pairs[i]);
-            float2 up = __bfloat1622float2(up_pairs[i]);
-            if constexpr (IS_CLAMPED) {
-                gate = {fminf(gate.x, swiglu_limit), fminf(gate.y, swiglu_limit)};
-                up = {
-                    fminf(fmaxf(up.x, -swiglu_limit), swiglu_limit),
-                    fminf(fmaxf(up.y, -swiglu_limit), swiglu_limit),
-                };
-            }
-            float2 denominator = base_ops::mul::op<float2>(gate, float2{-1.0f, -1.0f});
-            denominator = base_ops::exp::op<float2>(denominator);
-            denominator = base_ops::sum::op<float2>(denominator, float2{1.0f, 1.0f});
-            gate = base_ops::div::op<float2>(gate, denominator);
-            gate = base_ops::mul::op<float2>(gate, up);
-            hidden_pairs[i] = __floats2bfloat162_rn(gate.x, gate.y);
-        }
-        // All hidden BF16 elements must be visible before quantization.  On
-        // macro 0, both context streams continue reading their independent q
-        // sources across this synchronization and the hidden-normal pass.
-        epilogue_group::sync(1);
-
-        if constexpr (USE_ROUTED_MXFP8) {
-            if constexpr (SAVE_ROUTED_MXFP8_CONTEXT) {
-                // The third q pair is disjoint from both context sources, so
-                // hidden-normal quantization overlaps both TMA source reads.
-                mxfp8::quantize_tile<
-                    true, false, config::SWIGLU_Nb, false, false, false>(
-                    gate_raw_smem,
-                    hidden_q_fp8_smem, hidden_q_sc_smem,
-                    hidden_q_fp8_smem, hidden_q_sc_smem, nullptr,
-                    epilogue_group::laneid(), 1);
-
-                // Only the elected leader issued the four context stores.  Its
-                // read wait closes both source lifetimes; the warpgroup sync
-                // then makes Gate q reusable by every epilogue thread.
-                if (epilogue_group::laneid() == 0)
-                    tma::store_async_read_wait();
-                epilogue_group::sync(1);
-
-                mxfp8::quantize_tile<
-                    false, true, config::SWIGLU_Nb, false, false, false>(
-                    gate_raw_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem, nullptr,
-                    epilogue_group::laneid(), 1);
-                epilogue_group::sync(1);
-
-                if (epilogue_group::laneid() == 0) {
-                    tma::store_async(hidden_gmem, hidden_q_fp8_smem,
-                                     {output_row, tile_coord.y});
-                    tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
-                                     {output_row, tile_coord.y, 0, 0});
-                    tma::store_async(*hidden_t_gmem, gate_q_fp8_smem,
-                                     {tile_coord.y, output_row});
-                    tma::store_async(*hidden_sc_t_gmem, gate_q_sc_smem,
-                                     {tile_coord.y, output_row, 0, 0});
-                    // Full completion covers context and hidden writes before
-                    // Down observes this row-block's ready counter.
-                    tma::store_async_wait();
-                    barrier_arrive(
-                        hidden_row_block_ready,
-                        hidden_row_block_ready_base_index
-                            + macrobatch_row_block_offset + tile_coord.x);
+            const auto *gate_pairs =
+                reinterpret_cast<const bf16_2 *>(gate_raw_smem.data);
+            const auto *up_pairs =
+                reinterpret_cast<const bf16_2 *>(up_raw_smem.data);
+            auto *hidden_pairs = reinterpret_cast<bf16_2 *>(gate_raw_smem.data);
+            constexpr int NUM_PAIRS = config::SWIGLU_Mb * config::SWIGLU_Nb / 2;
+            constexpr int EPILOGUE_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+            #pragma unroll 1
+            for (int i = epilogue_group::laneid(); i < NUM_PAIRS;
+                 i += EPILOGUE_THREADS) {
+                float2 gate = __bfloat1622float2(gate_pairs[i]);
+                float2 up = __bfloat1622float2(up_pairs[i]);
+                if constexpr (IS_CLAMPED) {
+                    gate = {
+                        fminf(gate.x, swiglu_limit),
+                        fminf(gate.y, swiglu_limit),
+                    };
+                    up = {
+                        fminf(fmaxf(up.x, -swiglu_limit), swiglu_limit),
+                        fminf(fmaxf(up.y, -swiglu_limit), swiglu_limit),
+                    };
                 }
-            } else {
-                // Routed MXFP8 macro>0: V3a's one-q hidden-normal fast path.
-                mxfp8::quantize_tile<
-                    true, false, config::SWIGLU_Nb, false, false, false>(
-                    gate_raw_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem,
-                    gate_q_fp8_smem, gate_q_sc_smem, nullptr,
-                    epilogue_group::laneid(), 1);
-                epilogue_group::sync(1);
-                if (epilogue_group::laneid() == 0) {
-                    tma::store_async(hidden_gmem, gate_q_fp8_smem,
-                                     {output_row, tile_coord.y});
-                    tma::store_async(*hidden_sc_gmem, gate_q_sc_smem,
-                                     {output_row, tile_coord.y, 0, 0});
-                    tma::store_async_wait();
-                    barrier_arrive(
-                        hidden_row_block_ready,
-                        hidden_row_block_ready_base_index
-                            + macrobatch_row_block_offset + tile_coord.x);
-                }
+                float2 denominator = base_ops::mul::op<float2>(
+                    gate, float2{-1.0f, -1.0f});
+                denominator = base_ops::exp::op<float2>(denominator);
+                denominator = base_ops::sum::op<float2>(
+                    denominator, float2{1.0f, 1.0f});
+                gate = base_ops::div::op<float2>(gate, denominator);
+                gate = base_ops::mul::op<float2>(gate, up);
+                hidden_pairs[i] = __floats2bfloat162_rn(gate.x, gate.y);
             }
-        } else {
+            epilogue_group::sync(1);
+
             if (epilogue_group::laneid() == 0) {
                 tma::store_async(hidden_gmem, gate_raw_smem,
                                  {output_row, tile_coord.y});

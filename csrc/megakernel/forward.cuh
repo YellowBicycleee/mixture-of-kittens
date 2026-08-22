@@ -1,24 +1,3 @@
-// Forward macro-0 routed MXFP8 Down shares the compact three-stage operand
-// ring with fused Gate/Up.  grouped_gemm aligns its output scratch up to 1 KiB,
-// so account for that 512-byte internal pad and the outer base's worst-case
-// 1023-byte alignment shift explicitly here without changing the generic
-// depth-6 Backward/Recompute instantiations.
-static constexpr uint64_t FWD_MACRO0_MXFP8_DOWN_RING_BYTES =
-    FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH
-    * (2 * sizeof(mlp_fp8_tile) + 3 * sizeof(mlp_sc_tile));
-static constexpr uint64_t FWD_MACRO0_MXFP8_DOWN_SCRATCH_OFFSET =
-    (FWD_MACRO0_MXFP8_DOWN_RING_BYTES + 1023) & ~uint64_t(1023);
-static constexpr uint64_t FWD_MACRO0_MXFP8_DOWN_ACTIVE_BYTES =
-    FWD_MACRO0_MXFP8_DOWN_SCRATCH_OFFSET
-    + config::MLP_NUM_BF16_D_TILES * sizeof(mlp_bf16_d_tile);
-static_assert(FWD_MACRO0_MXFP8_DOWN_RING_BYTES == 102912);
-static_assert(FWD_MACRO0_MXFP8_DOWN_SCRATCH_OFFSET == 103424);
-static_assert(FWD_MACRO0_MXFP8_DOWN_ACTIVE_BYTES == 128000);
-static_assert(
-    FWD_MACRO0_MXFP8_DOWN_ACTIVE_BYTES + 1023
-    <= config::DYNAMIC_SHARED_MEMORY);
-static_assert(FWD_MACRO0_MXFP8_DOWN_ACTIVE_BYTES + 1023 <= 231424);
-
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(const globals_fwd &g) {
     int cluster_idx = clusterIdx().x;
@@ -145,24 +124,6 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
 
     // Fused Gate/Up/SwiGLU and Down are both cluster-cooperative tasks.
     auto is_cta_local_task = [&](int) { return false; };
-    auto uses_compact_routed_mxfp8_smem = [&](int compute_cluster_idx) {
-        if constexpr (!USE_MXFP8) {
-            return false;
-        } else {
-            if (compute_cluster_idx < shared_tasks)
-                return false;
-            const int task_ordered_global_minibatch_idx =
-                (compute_cluster_idx - shared_tasks) / minibatch_tasks;
-            const int task_macrobatch_idx =
-                task_ordered_global_minibatch_idx < last_macrobatch_num_minibatches
-                    ? num_macrobatches - 1
-                    : num_macrobatches - 2
-                        - (task_ordered_global_minibatch_idx
-                           - last_macrobatch_num_minibatches)
-                            / minibatches_per_macrobatch;
-            return task_macrobatch_idx == 0;
-        }
-    };
     const int hidden_row_block_ready_required_count = (config::MLP_Mb / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
 
     for (int task_iter = 0; cluster_idx >= 0 && cluster_idx < true_num_clusters; ++task_iter) {
@@ -177,14 +138,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
 
         const int compute_cluster_idx = cluster_idx - comm_clusters;
         const bool current_is_cta_local = is_cta_local_task(compute_cluster_idx);
-        bool current_uses_compact_smem = false;
 
         if (compute_cluster_idx < shared_gate_up_tasks) {
             // Shared Gate + Up + SwiGLU (BF16). Shared preactivations are
             // retained because shared-expert backward does not replay them.
             const int task_idx = compute_cluster_idx;
-            expert_gate_up_swiglu_ep8_tuned_kernel<
-                true, IS_CLAMPED, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>(
+            expert_gate_up_swiglu_ep8_tuned_kernel<true, IS_CLAMPED>(
                 g.x_shared, g.w_shared_gate, g.w_shared_up,
                 nullptr, nullptr, nullptr,
                 g.gate_shared, nullptr, g.up_shared, nullptr,
@@ -199,8 +158,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
         } else if (compute_cluster_idx < shared_tasks) {
             // Shared down (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks;
-            expert_grouped_gemm_kernel<
-                true, false, false, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>(g.hidden_shared, g.w_shared_down, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            expert_grouped_gemm_kernel<true, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_shared, g.w_shared_down, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                       g.y_shared, nullptr, nullptr,
                                       g.tokens_per_expert, nullptr, &g.hidden_row_block_ready, nullptr, nullptr, nullptr, nullptr,
                                       d_tt, a_sc_tt, b_sc_tt,
@@ -220,51 +178,32 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                 macrobatch_idx = num_macrobatches - 2 - idx / minibatches_per_macrobatch;
                 minibatch_idx = idx % minibatches_per_macrobatch;
             }
-            current_uses_compact_smem = USE_MXFP8 && macrobatch_idx == 0;
 
             if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                 // Routed Gate + Up + SwiGLU. Only macrobatch 0 retains
                 // preactivations/transpose context; hidden normal is written
                 // for every macrobatch so Down can consume it immediately.
                 const int task_idx = minibatch_task_idx;
-                auto run_routed_gate_up = [&](auto load_depth) {
-                    constexpr int LOAD_PIPE_DEPTH = decltype(load_depth)::value;
-                    expert_gate_up_swiglu_ep8_tuned_kernel<
-                        false, IS_CLAMPED, LOAD_PIPE_DEPTH>(
-                        g.x_fp8_routed, g.w_routed_gate, g.w_routed_up,
-                        &g.x_sc_routed, &g.w_routed_gate_sc, &g.w_routed_up_sc,
-                        g.gate_fp8_routed, &g.gate_sc_routed,
-                        g.up_fp8_routed, &g.up_sc_routed,
-                        g.hidden_fp8_routed, &g.hidden_sc_routed,
-                        &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
-                        g.tokens_per_expert, &g.x_routed_ready,
-                        g.hidden_row_block_ready,
-                        d_tt, a_sc_tt, b_sc_tt,
-                        gemm_inputs_arrived, gemm_scales_arrived,
-                        gemm_inputs_finished, gemm_scales_finished,
-                        gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                        num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
-                        macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                        shared_row_blocks, smem_base_addr);
-                };
-                if constexpr (USE_MXFP8) {
-                    if (macrobatch_idx == 0)
-                        run_routed_gate_up(std::integral_constant<
-                            int, FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH>{});
-                    else
-                        run_routed_gate_up(std::integral_constant<
-                            int, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>{});
-                } else {
-                    run_routed_gate_up(std::integral_constant<
-                        int, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>{});
-                }
+                expert_gate_up_swiglu_ep8_tuned_kernel<false, IS_CLAMPED>(
+                    g.x_fp8_routed, g.w_routed_gate, g.w_routed_up,
+                    &g.x_sc_routed, &g.w_routed_gate_sc, &g.w_routed_up_sc,
+                    g.gate_fp8_routed, &g.gate_sc_routed,
+                    g.up_fp8_routed, &g.up_sc_routed,
+                    g.hidden_fp8_routed, &g.hidden_sc_routed,
+                    &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
+                    g.tokens_per_expert, &g.x_routed_ready,
+                    g.hidden_row_block_ready,
+                    d_tt, a_sc_tt, b_sc_tt,
+                    gemm_inputs_arrived, gemm_scales_arrived,
+                    gemm_inputs_finished, gemm_scales_finished,
+                    gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                    num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                    macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                    shared_row_blocks, smem_base_addr);
             } else {
                 // Routed down
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
-                auto run_routed_down = [&](auto load_depth) {
-                    constexpr int LOAD_PIPE_DEPTH = decltype(load_depth)::value;
-                    expert_grouped_gemm_kernel<
-                        false, false, false, LOAD_PIPE_DEPTH>(g.hidden_fp8_routed, g.w_routed_down, &g.hidden_sc_routed, &g.w_routed_down_sc, nullptr, nullptr, nullptr, nullptr,
+                expert_grouped_gemm_kernel<false, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_fp8_routed, g.w_routed_down, &g.hidden_sc_routed, &g.w_routed_down_sc, nullptr, nullptr, nullptr, nullptr,
                                            g.y_routed, nullptr, nullptr,
                                            g.tokens_per_expert, nullptr, &g.hidden_row_block_ready,
                                            macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_done : nullptr,
@@ -273,18 +212,6 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                            gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
                                            0, shared_row_blocks, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
-                };
-                if constexpr (USE_MXFP8) {
-                    if (macrobatch_idx == 0)
-                        run_routed_down(std::integral_constant<
-                            int, FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH>{});
-                    else
-                        run_routed_down(std::integral_constant<
-                            int, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>{});
-                } else {
-                    run_routed_down(std::integral_constant<
-                        int, FUSED_GATE_UP_V3A_LOAD_PIPE_DEPTH>{});
-                }
             }
         }
 
@@ -294,21 +221,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
         __syncwarp();
         warp::tma::cluster::arrive(schedule_finished[clc_stage], 0);
 
-        // The logical task order is last-macrobatch -> macro 0, so the normal
-        // transition is depth 4 -> depth 3.  CLC itself does not promise an
-        // index order, however.  If it ever returns a noncompact task after a
-        // compact task, fence the whole cluster before depth-4 slot/layout
-        // storage can overlap the prior depth-3 scratch.
+        // SWIGLU -> GEMM requires a cluster-wide sync
         const int next_compute_cluster_idx = cluster_idx - comm_clusters;
-        const bool next_task_is_valid =
-            cluster_idx >= 0 && cluster_idx < true_num_clusters;
-        const bool needs_smem_layout_transition_fence =
-            current_uses_compact_smem && next_task_is_valid
-            && !uses_compact_routed_mxfp8_smem(next_compute_cluster_idx);
-        if (next_task_is_valid
-            && ((current_is_cta_local
-                 && !is_cta_local_task(next_compute_cluster_idx))
-                || needs_smem_layout_transition_fence))
+        if (current_is_cta_local && cluster_idx >= 0 && !is_cta_local_task(next_compute_cluster_idx))
             everyone::tma::cluster::sync();
     }
 
