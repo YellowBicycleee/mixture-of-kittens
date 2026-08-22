@@ -92,7 +92,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
             return (combine_tiles + config::COMBINE_PIPE_DEPTH - 1) / config::COMBINE_PIPE_DEPTH;
         };
         auto dispatch = [&](int macrobatch_idx, int task_idx) {
-            dispatch_kernel<false>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, &g.x_fp8_t_routed, &g.x_sc_t_routed,
+            // Forward executes macrobatches from last to 0, so only macro 0
+            // must leave the transposed activation saved for backward. Other
+            // macros regenerate it in backward replay.
+            auto *x_fp8_t_routed = macrobatch_idx == 0 ? &g.x_fp8_t_routed : nullptr;
+            auto *x_sc_t_routed = macrobatch_idx == 0 ? &g.x_sc_t_routed : nullptr;
+            dispatch_kernel<false>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, x_fp8_t_routed, x_sc_t_routed,
                                      nullptr, g.schedule_peer_rank, g.schedule_peer_token_idx,
                                      macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_ready : nullptr, nullptr, g.x_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,

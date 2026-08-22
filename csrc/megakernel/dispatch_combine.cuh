@@ -86,6 +86,11 @@ static __device__ __forceinline__ void dispatch_kernel(
     update_phasebit<0>(bitfield, 0);
 
     if constexpr (USE_MXFP8) {
+        // Forward only needs the transposed activation saved for macrobatch 0;
+        // later macrobatches recreate it during backward replay. A null
+        // transposed destination therefore selects the normal-only path.
+        const bool return_transposed = x_t_gmem != nullptr;
+
         // Quantize each 128x128 subtile of the staging buffer
         const int row_block = row_idx / config::QUANT_Mb;
         const int num_subtiles = chunk_cols / config::QUANT_Nb;
@@ -95,20 +100,37 @@ static __device__ __forceinline__ void dispatch_kernel(
                     smem_base_addr + subtile * config::QUANT_Nb * sizeof(bf16));
                 const int out = subtile % config::DISPATCH_OUT_TILES;
 
-                if (tid == 0) tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
+                if (tid == 0) {
+                    if (return_transposed)
+                        tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
+                    else
+                        tma::store_async_read_wait<2 * (config::DISPATCH_OUT_TILES - 1)>();
+                }
                 __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
-                if constexpr (!SCALE_ROWS)
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
-                else
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                if (return_transposed) {
+                    if constexpr (!SCALE_ROWS)
+                        mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
+                    else
+                        mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                } else {
+                    // The normal output is disjoint from the BF16 source, so
+                    // stream one K block at a time instead of retaining the
+                    // whole tile in registers.
+                    if constexpr (!SCALE_ROWS)
+                        mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, false, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
+                    else
+                        mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, true, false> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                }
                 __syncthreads(); // quantized tiles must be complete before TMA reads them
 
                 if (tid == 0) {
                     const int col_block = col_block_idx * (config::DISPATCH_Nb / config::QUANT_Nb) + subtile;
                     tma::store_async(x_gmem, x_fp8_tiles[out], {row_block, col_block});
                     tma::store_async(*x_sc_gmem, x_sc_tiles[out], {row_block, col_block, 0, 0});
-                    tma::store_async(*x_t_gmem, x_fp8_t_tiles[out], {col_block, row_block});
-                    tma::store_async(*x_sc_t_gmem, x_sc_t_tiles[out], {col_block, row_block, 0, 0});
+                    if (return_transposed) {
+                        tma::store_async(*x_t_gmem, x_fp8_t_tiles[out], {col_block, row_block});
+                        tma::store_async(*x_sc_t_gmem, x_sc_t_tiles[out], {col_block, row_block, 0, 0});
+                    }
                 }
             }
         }
