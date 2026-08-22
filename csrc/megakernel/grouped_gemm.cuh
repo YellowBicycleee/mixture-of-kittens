@@ -241,14 +241,20 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     tma::expect_bytes(gemm_scales_arrived[input_ring], config::CLUSTER_SIZE * 3 * sizeof(mlp_sc_tile));
                     wait(gemm_scales_arrived[input_ring], get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring));
                     update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring);
+                    if constexpr (LOAD_PIPE_DEPTH == 3) {
+                        tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                        wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                    }
                     auto a_sc_tt_subtile = a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16);
                     auto b_sc_tt_subtile_0 = b_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 32);
                     auto b_sc_tt_subtile_1 = b_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 32 + 16);
                     load_mxnv_scale_async2(a_sc_tt_subtile, a_sc_smem[input_ring]);
                     load_mxnv_scale_async2(b_sc_tt_subtile_0, b_sc_smem[input_ring][0]);
                     load_mxnv_scale_async2(b_sc_tt_subtile_1, b_sc_smem[input_ring][1], gemm_scales_finished[input_ring]);
-                    tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
-                    wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                    if constexpr (LOAD_PIPE_DEPTH != 3) {
+                        tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                        wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                    }
                     if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
                                            a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
                                            b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),

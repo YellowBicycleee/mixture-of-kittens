@@ -307,6 +307,17 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                                          config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring));
                     update_phasebit<0>(gemm_bitfield,
                                        config::MLP_LOAD_PIPE_DEPTH + 1 + input_ring);
+                    // The compact ring can revisit a TMEM scale slot before
+                    // the prior MMA has consumed it.  Waiting for the next
+                    // A/B tile establishes a transitive dependency through
+                    // the input producer's gemm_inputs_finished wait.
+                    if constexpr (LOAD_PIPE_DEPTH == FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH) {
+                        tma::expect_bytes(
+                            gemm_inputs_arrived[input_ring],
+                            config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                        wait(gemm_inputs_arrived[input_ring],
+                             get_phasebit<0>(gemm_bitfield, input_ring));
+                    }
                     auto a_sc_tt_subtile =
                         a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16);
                     auto b_sc_tt_subtile_0 =
@@ -318,11 +329,13 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                     load_mxnv_scale_async2(
                         b_sc_tt_subtile_1, b_sc_smem[input_ring][1],
                         gemm_scales_finished[input_ring]);
-                    tma::expect_bytes(
-                        gemm_inputs_arrived[input_ring],
-                        config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
-                    wait(gemm_inputs_arrived[input_ring],
-                         get_phasebit<0>(gemm_bitfield, input_ring));
+                    if constexpr (LOAD_PIPE_DEPTH != FUSED_GATE_UP_MACRO0_MXFP8_LOAD_PIPE_DEPTH) {
+                        tma::expect_bytes(
+                            gemm_inputs_arrived[input_ring],
+                            config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                        wait(gemm_inputs_arrived[input_ring],
+                             get_phasebit<0>(gemm_bitfield, input_ring));
+                    }
                     if (idx == 0) {
                         mm2_ABt(
                             d_tt, a_smem[input_ring], b_smem[input_ring],
