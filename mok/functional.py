@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,18 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    bwd_schedule: Literal["macrobatch", "minibatch"] = "macrobatch"
+
+
+def _use_minibatch_bwd_schedule(config: MoKConfig) -> bool:
+    if not isinstance(config, MoKConfig):
+        raise TypeError("config must be a MoKConfig")
+    if type(config.bwd_schedule) is not str or config.bwd_schedule not in (
+        "macrobatch",
+        "minibatch",
+    ):
+        raise ValueError("bwd_schedule must be either 'macrobatch' or 'minibatch'")
+    return config.bwd_schedule == "minibatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -702,6 +714,7 @@ def backward(
         d_shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         d_shared_down_weights: bfloat16 [hidden_size, intermediate_size]
     """
+    use_minibatch_release = _use_minibatch_bwd_schedule(config)
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
@@ -744,7 +757,7 @@ def backward(
             schedule.peer_rank, schedule.peer_token_idx,
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+            config.macrobatch_size, config.minibatch_size, use_minibatch_release,
         )
     else:
         x_routed = forward_context.x_routed
@@ -769,7 +782,7 @@ def backward(
             schedule.peer_rank, schedule.peer_token_idx,
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+            config.macrobatch_size, config.minibatch_size, use_minibatch_release,
         )
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,

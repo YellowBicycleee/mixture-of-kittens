@@ -32,6 +32,24 @@ RESULT_NAMES = (
 )
 
 
+def test_bwd_schedule_selection() -> None:
+    default_config = functional.MoKConfig()
+    legacy_positional_config = functional.MoKConfig(40, 28, 4096, 131072, 0.5, 2048)
+    minibatch_config = functional.MoKConfig(bwd_schedule="minibatch")
+
+    assert default_config.bwd_schedule == "macrobatch"
+    assert legacy_positional_config.bwd_schedule == "macrobatch"
+    assert not functional._use_minibatch_bwd_schedule(default_config)
+    assert functional._use_minibatch_bwd_schedule(minibatch_config)
+
+
+@pytest.mark.parametrize("invalid_schedule", ["", "mini", "MACROBATCH", True, None])
+def test_bwd_schedule_rejects_invalid_values(invalid_schedule: object) -> None:
+    config = functional.MoKConfig(bwd_schedule=invalid_schedule)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bwd_schedule"):
+        functional._use_minibatch_bwd_schedule(config)
+
+
 def _run_e2e_case(
     context: tuple[int, int, torch.device],
     *,
@@ -545,8 +563,10 @@ def test_ep1_on_each_rank(
                 dist.destroy_process_group(group)
 
 
+@pytest.mark.parametrize("bwd_schedule", ["macrobatch", "minibatch"])
 def test_e2e_fixed_first_topk_experts_default_capacity(
     context: tuple[int, int, torch.device],
+    bwd_schedule: str,
 ) -> None:
     _, _, device = context
     functional.clear_workspace_cache()
@@ -554,7 +574,7 @@ def test_e2e_fixed_first_topk_experts_default_capacity(
     try:
         _run_e2e_case(
             context,
-            name="fixed-first-topk/default-capacity",
+            name=f"fixed-first-topk/default-capacity/{bwd_schedule}",
             hidden_size=7168,
             intermediate_size=2048,
             num_local_experts=4,
@@ -562,6 +582,7 @@ def test_e2e_fixed_first_topk_experts_default_capacity(
             config=functional.MoKConfig(
                 minibatch_size=256,
                 macrobatch_size=512,
+                bwd_schedule=bwd_schedule,
             ),
             precisions=("bf16", "mxfp8"),
             top_experts=torch.arange(
@@ -1035,6 +1056,7 @@ def test_fake_tensor_metadata(
             2,
             macrobatch_size,
             256,
+            False,
         )
         _assert_metadata(
             mxfp8_backward,
@@ -1183,6 +1205,7 @@ def test_fake_tensor_metadata(
             2,
             macrobatch_size,
             256,
+            False,
         )
         _assert_metadata(
             bf16_backward,

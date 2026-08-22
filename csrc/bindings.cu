@@ -43,7 +43,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("minibatch_release"));
     m.def("dispatch_mlp_swiglu_combine_fwd_bf16", &dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -70,7 +71,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("minibatch_release"));
     m.def("fwd_epilogue", &utils::fwd_epilogue::fwd_epilogue_entrypoint, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
     m.def("bwd_epilogue", &utils::bwd_epilogue::bwd_epilogue_entrypoint, "",

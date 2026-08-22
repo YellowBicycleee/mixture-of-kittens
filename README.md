@@ -1,6 +1,6 @@
 # Mixture-of-Kittens (MoK)
 
-Mixture-of-Kittens (MoK) is a fully deterministic mixture-of-experts (MoE) training megakernel built from first principles for NVL72s. MoK fuses all MoE computation and communication into a single kernel, overlapping compute and inter-GPU networking at configurable granularity, and fully eliminates CPU-GPU synchronization. It supports BF16 and MXFP8, covers both forward and backward passes, and powers production training of Composer at Cursor.
+Mixture-of-Kittens (MoK) is a mixture-of-experts (MoE) training megakernel built from first principles for NVL72s. Its default execution path, including macrobatch-ordered backward weight-gradient accumulation, is fully deterministic. The opt-in minibatch backward schedule described below is not bitwise deterministic. MoK fuses all MoE computation and communication into a single kernel, overlapping compute and inter-GPU networking at configurable granularity, and fully eliminates CPU-GPU synchronization. It supports BF16 and MXFP8, covers both forward and backward passes, and powers production training of Composer at Cursor.
 
 For a deep dive, read our [blog post](https://cursor.com/blog/mixture-of-kittens).
 
@@ -89,12 +89,13 @@ With the functional API, MoK is simple to use: call `schedule(...)` once to buil
 
 ### Config
 
-MoK exposes 5 hyperparameters that can affect the performance of MoE execution. Because optimal values depend heavily on the workload, you should tune and sweep them before using MoK in production.
+MoK exposes several settings that can affect the performance of MoE execution. Because optimal values depend heavily on the workload, you should tune and sweep them before using MoK in production.
 
 - `fwd_num_comm_sms`: the number of communication SMs during forward. We recommend values between 4 and 52.
 - `bwd_num_comm_sms`: the number of communication SMs during backward. We recommend values between 4 and 52.
 - `minibatch_size`: the granularity of computation–communication overlap. This is an important parameter in MoK, and you must tune it properly to get optimal performance. We recommend values between 2048 and 16384.
-- `macrobatch_size`: the token ring buffer size. Setting this to a large value (e.g., 131072) means the ring buffer is used only once. You should maximize this value to fill the available GPU memory.
+- `macrobatch_size`: the token ring buffer size. A larger value can reduce ring buffer reuse, but is not always faster. Sweep this jointly with `bwd_schedule` using the actual routed-token count and expert distribution, and choose a value that fits the available GPU memory.
+- `bwd_schedule`: the backward scheduling mode. `"macrobatch"` (the default) commits routed weight-gradient work in deterministic macrobatch order. The opt-in `"minibatch"` mode releases dependent backward work after each minibatch, enabling finer-grained overlap. Independent minibatches can then accumulate into the same routed weight gradients in different orders, so this mode is not bitwise deterministic. Its performance is workload-dependent and can regress when the ring is large enough to avoid frequent reuse; sweep both backward modes with the actual routed-token count and expert distribution instead of relying on a fixed threshold. All ranks in an expert-parallel group must use the same value.
 - `schedule_capacity_multiplier`: defaults to 0.5. This should be set to the worst-case fraction of tokens routed to a single rank. Setting it to 1 assumes the absolute worst case (all tokens routed to one rank) but adds kernel scheduling overhead (due to expert padding, the actual worst case is slightly above 1.0). Ideally, use a higher value during the first steps of training when expert imbalance is bad, then reduce it to around 0.5 in later steps. Note that decreasing this value does not save GPU memory meaningfully, as the schedule table is at most a few megabytes.
 
 You can set these values when creating the `MoKConfig` dataclass, which you pass to all functional-layer functions.

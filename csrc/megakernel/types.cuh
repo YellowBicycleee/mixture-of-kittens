@@ -234,6 +234,7 @@ struct globals_bwd {
     index_gl schedule_peer_token_idx;                     // (schedule_capacity,)
     index_gl num_tokens;                                  // (1,)
     index_gl tokens_per_expert;                           // (num_local_experts,)
+    index_gl minibatch_expert_offsets;                    // experimental: (capacity minibatches + 1,) compact mini/expert-pair prefix
 
     // Barrier
     index_gl router_weights_ready;                        // (num_macrobatches,) router preload -> reverse-combine
@@ -245,12 +246,14 @@ struct globals_bwd {
     index_gl replayed_gate_up_ready;                      // (routed gate/up tasks,) replayed gate/up -> replayed swiglu
     index_gl replayed_hidden_ready;                       // (routed row blocks,) replayed swiglu -> wgrad down
     index_gl routed_buffers_done;                         // (num_macrobatches,) current macrobatch -> next macrobatch
+    index_gl wgrad_read_consumed;                         // experimental: (num_minibatches,) Wgrad source reads complete
 
     const int topk;
     const float swiglu_limit;
     const int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;
+    const int minibatch_release;
 
     __host__ inline dim3 grid() const {
         const int capacity = schedule_peer_rank.cols();
@@ -268,6 +271,21 @@ struct globals_bwd {
         const int shared_tasks = shared_row_blocks * intermediate_dim_col_blocks + shared_swiglu_bwd_tasks + shared_row_blocks * hidden_dim_col_blocks + 3 * intermediate_dim_col_blocks * hidden_dim_col_blocks;
         const int minibatch_bwd_tasks = minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_bwd_tasks + minibatch_row_blocks * hidden_dim_col_blocks;
         const int minibatch_replay_tasks = 2 * minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_fwd_tasks;
+        if (minibatch_release) {
+            const int saved_minibatches = min(num_minibatches, macrobatch_size / minibatch_size);
+            // Nonempty expert segments partition the routed rows.  Therefore
+            // the number of (minibatch, expert) intersections is at most one
+            // per minibatch plus one per internal expert boundary.
+            const int max_minibatch_expert_pairs =
+                num_minibatches + max(0, w_routed_gate.depth() - 1);
+            const int minibatch_wgrad_tasks =
+                3 * max_minibatch_expert_pairs * intermediate_dim_col_blocks * hidden_dim_col_blocks;
+            return dim3(config::CLUSTER_SIZE *
+                        (shared_tasks + num_minibatches * minibatch_bwd_tasks +
+                         (num_minibatches - saved_minibatches) * minibatch_replay_tasks +
+                         minibatch_wgrad_tasks) +
+                        num_comm_sms);
+        }
         const int num_replay_minibatches = (num_macrobatches - 1) * (macrobatch_size / minibatch_size);
         const int wgrad_tasks = 3 * w_routed_gate.depth() * intermediate_dim_col_blocks * hidden_dim_col_blocks;
         return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_bwd_tasks + num_replay_minibatches * minibatch_replay_tasks + num_macrobatches * wgrad_tasks) + num_comm_sms);

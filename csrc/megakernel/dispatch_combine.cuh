@@ -166,7 +166,9 @@ static __device__ __forceinline__ void combine_kernel(
     const int minibatch_size,
     const int macrobatch_idx,
     const int task_idx,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int tile_base = 0,
+    const int tile_count = -1
 ) {
     auto &token_chunks = *reinterpret_cast<bf16 (*)[config::COMBINE_PIPE_DEPTH][config::COMBINE_Mb][config::COMBINE_Nb]>(smem_base_addr);
 
@@ -175,11 +177,14 @@ static __device__ __forceinline__ void combine_kernel(
 
     const int cols = local_buf.cols();
     const int col_blocks = (cols + config::COMBINE_Nb - 1) / config::COMBINE_Nb;
-    const int first_tile_idx = task_idx * config::COMBINE_PIPE_DEPTH;
+    const int first_tile_idx = tile_base + task_idx * config::COMBINE_PIPE_DEPTH;
 
     const int macrobatch_offset = macrobatch_idx * macrobatch_size;
     const int num_macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
-    const int num_valid_tiles = min(config::COMBINE_PIPE_DEPTH, num_macrobatch_tokens / config::COMBINE_Mb * col_blocks - first_tile_idx); // because we pad to 256
+    const int tile_end = tile_count < 0
+                       ? num_macrobatch_tokens / config::COMBINE_Mb * col_blocks
+                       : tile_base + tile_count;
+    const int num_valid_tiles = min(config::COMBINE_PIPE_DEPTH, tile_end - first_tile_idx); // because we pad to 256
     if (num_valid_tiles <= 0) return;
 
     const int first_row_idx = first_tile_idx / col_blocks * config::COMBINE_Mb + tid;

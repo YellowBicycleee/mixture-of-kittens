@@ -1,4 +1,68 @@
-template <bool IS_CLAMPED>
+struct minibatch_expert_offsets_config {
+    static constexpr int NUM_THREADS = WARP_THREADS;
+};
+
+struct minibatch_expert_offsets_globals {
+    index_gl minibatch_expert_offsets;
+    index_gl num_tokens;
+    index_gl tokens_per_expert;
+    int num_local_experts;
+    int minibatch_size;
+    int capacity_minibatches;
+};
+
+// Builds a compact prefix over (global minibatch, active expert) pairs without
+// changing the public route schedule.  This is a device function passed to
+// kittens::py::global_kernel because backward.cuh is included inside the
+// dispatch_mlp_swiglu_combiner class template (a raw __global__ member function
+// is not legal CUDA C++).  The valid prefix is
+// minibatch_expert_offsets[0..ceil(num_tokens / minibatch_size)].  Capacity
+// tail entries are filled with the final count so the tensor is always fully
+// initialized for diagnostics.
+static __device__ __forceinline__ void build_minibatch_expert_offsets_kernel(
+    const minibatch_expert_offsets_globals &g
+) {
+    if (threadIdx.x != 0) return;
+
+    const int routed_rows = g.num_tokens[{0}];
+    const int num_minibatches =
+        (routed_rows + g.minibatch_size - 1) / g.minibatch_size;
+    if (routed_rows < 0 || num_minibatches > g.capacity_minibatches)
+        asm volatile("{trap;}");
+
+    int expert_rows_total = 0;
+    for (int expert_idx = 0; expert_idx < g.num_local_experts; ++expert_idx) {
+        const int expert_rows = g.tokens_per_expert[{expert_idx}];
+        if (expert_rows < 0 || expert_rows % config::MLP_Mb != 0)
+            asm volatile("{trap;}");
+        expert_rows_total += expert_rows;
+    }
+    if (expert_rows_total != routed_rows)
+        asm volatile("{trap;}");
+
+    int pair_count = 0;
+    g.minibatch_expert_offsets[{0}] = 0;
+    for (int global_minibatch_idx = 0;
+         global_minibatch_idx < num_minibatches;
+         ++global_minibatch_idx) {
+        const int minibatch_begin = global_minibatch_idx * g.minibatch_size;
+        const int minibatch_end = min(minibatch_begin + g.minibatch_size, routed_rows);
+        int expert_begin = 0;
+        for (int expert_idx = 0; expert_idx < g.num_local_experts; ++expert_idx) {
+            const int expert_end = expert_begin + g.tokens_per_expert[{expert_idx}];
+            pair_count += max(expert_begin, minibatch_begin) <
+                          min(expert_end, minibatch_end);
+            expert_begin = expert_end;
+        }
+        g.minibatch_expert_offsets[{global_minibatch_idx + 1}] = pair_count;
+    }
+    for (int global_minibatch_idx = num_minibatches + 1;
+         global_minibatch_idx <= g.capacity_minibatches;
+         ++global_minibatch_idx)
+        g.minibatch_expert_offsets[{global_minibatch_idx}] = pair_count;
+}
+
+template <bool IS_CLAMPED, bool MINIBATCH_RELEASE = false>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(const globals_bwd &g) {
     const int num_local_experts = g.w_routed_gate.depth();
     const int intermediate_dim_col_blocks = g.hidden_shared.cols() / config::MLP_Nb;
@@ -24,6 +88,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
     const int wgrad_matrix_tasks = num_local_experts * intermediate_dim_col_blocks * hidden_dim_col_blocks;
     const int wgrad_tasks = 3 * wgrad_matrix_tasks;
+    const int wgrad_tile_tasks = intermediate_dim_col_blocks * hidden_dim_col_blocks;
 
     const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * intermediate_dim_col_blocks;
     const int minibatch_routed_swiglu_fwd_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
@@ -50,14 +115,34 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     auto routed_buffers_done_required_count_of = [&](int macrobatch_idx) {
         return config::CLUSTER_SIZE * (num_minibatches_of(macrobatch_idx) * minibatch_routed_bwd_tasks + wgrad_tasks) + num_combine_tasks_of(macrobatch_idx);
     };
+    auto wgrad_read_required_count_of = [&](int global_minibatch_idx) {
+        const int active_experts =
+            g.minibatch_expert_offsets[{global_minibatch_idx + 1}] -
+            g.minibatch_expert_offsets[{global_minibatch_idx}];
+        return 3 * active_experts * wgrad_tile_tasks;
+    };
+    auto minibatch_non_wgrad_required_count = [&]() {
+        // Each routed compute cluster has two CTA arrivals.  Every comm CTA
+        // contributes one arrival after reverse-dispatch has consumed the slot.
+        return config::CLUSTER_SIZE * minibatch_routed_bwd_tasks + g.num_comm_sms;
+    };
 
     const int num_minibatches = (num_tokens + g.minibatch_size - 1) / g.minibatch_size;
     const int saved_macrobatch_num_minibatches = num_minibatches_of(0);
     const int saved_macrobatch_tasks = saved_macrobatch_num_minibatches * minibatch_routed_bwd_tasks + wgrad_tasks;
     const int replayed_macrobatch_tasks = minibatches_per_macrobatch * (minibatch_routed_replay_tasks + minibatch_routed_bwd_tasks) + wgrad_tasks;
     const int num_replay_minibatches = num_minibatches - saved_macrobatch_num_minibatches;
-    const int true_num_clusters = comm_clusters + shared_tasks + num_minibatches * minibatch_routed_bwd_tasks +
-                                  num_replay_minibatches * minibatch_routed_replay_tasks + num_macrobatches * wgrad_tasks;
+    const int minibatch_expert_pairs = MINIBATCH_RELEASE
+        ? g.minibatch_expert_offsets[{num_minibatches}]
+        : 0;
+    const int compact_minibatch_wgrad_tasks =
+        3 * minibatch_expert_pairs * wgrad_tile_tasks;
+    const int true_num_clusters = MINIBATCH_RELEASE
+        ? comm_clusters + shared_tasks + num_minibatches * minibatch_routed_bwd_tasks +
+          num_replay_minibatches * minibatch_routed_replay_tasks +
+          compact_minibatch_wgrad_tasks
+        : comm_clusters + shared_tasks + num_minibatches * minibatch_routed_bwd_tasks +
+          num_replay_minibatches * minibatch_routed_replay_tasks + num_macrobatches * wgrad_tasks;
     if (cluster_idx >= true_num_clusters) return;
 
     warpgroup::increase_registers<256>();
@@ -140,7 +225,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         auto reverse_dispatch = [&](int macrobatch_idx, int task_idx) {
             combine_kernel(g.d_x_routed_buffer, g.d_x_routed, &g.d_router_weight_buffer, &g.d_router_weight_partials,
                            g.schedule_peer_rank, g.schedule_peer_token_idx,
-                           g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
+                           g.d_x_routed_ready, MINIBATCH_RELEASE ? nullptr : (num_macrobatches > 1 ? &g.routed_buffers_done : nullptr),
                            combine_inputs_arrived, combine_bitfield,
                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
         };
@@ -152,31 +237,153 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
                                      -1, 0, smem_base_addr);
         };
-        preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
-                                      g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                      nullptr, g.router_weights_ready,
-                                      num_tokens, macrobatch_size, 0, comm_cta_idx, g.num_comm_sms, -1, 0);
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(0); task_idx += g.num_comm_sms)
-            reverse_combine(0, task_idx);
-        for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
-            // All reverse-dispatch tasks must complete before this CTA moves on: the next macrobatch's pulls
-            // wait on routed_buffers_done, which counts every rank's reverse-dispatch arrivals (including this CTA's)
-            for (int task_idx = comm_cta_idx; task_idx < num_combine_tasks_of(macrobatch_idx); task_idx += g.num_comm_sms)
-                reverse_dispatch(macrobatch_idx, task_idx);
-            if (macrobatch_idx + 1 < num_macrobatches) {
-                preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
-                                              g.schedule_peer_rank, g.schedule_peer_token_idx,
-                                              &g.routed_buffers_done, g.router_weights_ready,
-                                              num_tokens, macrobatch_size, macrobatch_idx + 1, comm_cta_idx, g.num_comm_sms,
-                                              macrobatch_idx, routed_buffers_done_required_count_of(macrobatch_idx));
-                for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx + 1); task_idx += g.num_comm_sms) {
-                    reverse_combine(macrobatch_idx + 1, task_idx);
-                    replay_dispatch(macrobatch_idx + 1, task_idx);
+        if constexpr (!MINIBATCH_RELEASE) {
+            preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
+                                          g.schedule_peer_rank, g.schedule_peer_token_idx,
+                                          nullptr, g.router_weights_ready,
+                                          num_tokens, macrobatch_size, 0, comm_cta_idx, g.num_comm_sms, -1, 0);
+            for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(0); task_idx += g.num_comm_sms)
+                reverse_combine(0, task_idx);
+            for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
+                // All reverse-dispatch tasks must complete before this CTA moves on: the next macrobatch's pulls
+                // wait on routed_buffers_done, which counts every rank's reverse-dispatch arrivals (including this CTA's)
+                for (int task_idx = comm_cta_idx; task_idx < num_combine_tasks_of(macrobatch_idx); task_idx += g.num_comm_sms)
+                    reverse_dispatch(macrobatch_idx, task_idx);
+                if (macrobatch_idx + 1 < num_macrobatches) {
+                    preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
+                                                  g.schedule_peer_rank, g.schedule_peer_token_idx,
+                                                  &g.routed_buffers_done, g.router_weights_ready,
+                                                  num_tokens, macrobatch_size, macrobatch_idx + 1, comm_cta_idx, g.num_comm_sms,
+                                                  macrobatch_idx, routed_buffers_done_required_count_of(macrobatch_idx));
+                    for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx + 1); task_idx += g.num_comm_sms) {
+                        reverse_combine(macrobatch_idx + 1, task_idx);
+                        replay_dispatch(macrobatch_idx + 1, task_idx);
+                    }
+                }
+            }
+        } else {
+            const int dispatch_col_blocks = (g.d_y_shared.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
+            const int combine_col_blocks = (g.d_y_shared.cols() + config::COMBINE_Nb - 1) / config::COMBINE_Nb;
+            auto minibatch_rows_of = [&](int global_minibatch_idx) {
+                return min(g.minibatch_size, num_tokens - global_minibatch_idx * g.minibatch_size);
+            };
+            auto preload_and_reverse_combine = [&](int global_minibatch_idx, int previous_global_minibatch_idx) {
+                const int macrobatch_idx = global_minibatch_idx / minibatches_per_macrobatch;
+                const int local_minibatch_idx = global_minibatch_idx % minibatches_per_macrobatch;
+                preload_router_weights_minibatch_kernel(
+                    g.router_weight_buffer, g.router_weights,
+                    g.schedule_peer_rank, g.schedule_peer_token_idx,
+                    &g.routed_buffers_done, minibatch_non_wgrad_required_count(),
+                    &g.wgrad_read_consumed,
+                    previous_global_minibatch_idx >= 0 ? wgrad_read_required_count_of(previous_global_minibatch_idx) : 0,
+                    g.router_weights_ready,
+                    num_tokens, macrobatch_size, g.minibatch_size,
+                    global_minibatch_idx, comm_cta_idx, g.num_comm_sms,
+                    previous_global_minibatch_idx);
+
+                const int rows = minibatch_rows_of(global_minibatch_idx);
+                const int tasks = (rows / config::DISPATCH_Mb) * dispatch_col_blocks;
+                const int task_base = local_minibatch_idx * (g.minibatch_size / config::DISPATCH_Mb) * dispatch_col_blocks;
+                for (int local_task_idx = comm_cta_idx; local_task_idx < tasks; local_task_idx += g.num_comm_sms)
+                    reverse_combine(macrobatch_idx, task_base + local_task_idx);
+            };
+            auto replay_dispatch_minibatch = [&](int global_minibatch_idx) {
+                const int macrobatch_idx = global_minibatch_idx / minibatches_per_macrobatch;
+                const int local_minibatch_idx = global_minibatch_idx % minibatches_per_macrobatch;
+                const int rows = minibatch_rows_of(global_minibatch_idx);
+                const int tasks = (rows / config::DISPATCH_Mb) * dispatch_col_blocks;
+                const int task_base = local_minibatch_idx * (g.minibatch_size / config::DISPATCH_Mb) * dispatch_col_blocks;
+                for (int local_task_idx = comm_cta_idx; local_task_idx < tasks; local_task_idx += g.num_comm_sms)
+                    replay_dispatch(macrobatch_idx, task_base + local_task_idx);
+            };
+            auto reverse_dispatch_minibatch = [&](int global_minibatch_idx) {
+                const int macrobatch_idx = global_minibatch_idx / minibatches_per_macrobatch;
+                const int local_minibatch_idx = global_minibatch_idx % minibatches_per_macrobatch;
+                const int rows = minibatch_rows_of(global_minibatch_idx);
+                const int tile_count = (rows / config::COMBINE_Mb) * combine_col_blocks;
+                const int tile_base = local_minibatch_idx * (g.minibatch_size / config::COMBINE_Mb) * combine_col_blocks;
+                const int tasks = (tile_count + config::COMBINE_PIPE_DEPTH - 1) / config::COMBINE_PIPE_DEPTH;
+                for (int local_task_idx = comm_cta_idx; local_task_idx < tasks; local_task_idx += g.num_comm_sms) {
+                    combine_kernel(g.d_x_routed_buffer, g.d_x_routed, &g.d_router_weight_buffer, &g.d_router_weight_partials,
+                                   g.schedule_peer_rank, g.schedule_peer_token_idx,
+                                   g.d_x_routed_ready, nullptr,
+                                   combine_inputs_arrived, combine_bitfield,
+                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, local_task_idx,
+                                   smem_base_addr, tile_base, tile_count);
+                }
+                if (threadIdx.x == 0)
+                    barrier_arrive(g.routed_buffers_done, global_minibatch_idx);
+                __syncthreads();
+            };
+
+            // Seed the saved forward-context macrobatch one minibatch at a time.
+            for (int minibatch_idx = 0; minibatch_idx < num_minibatches_of(0); ++minibatch_idx)
+                preload_and_reverse_combine(minibatch_idx, -1);
+
+            for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
+                for (int minibatch_idx = 0; minibatch_idx < num_minibatches_of(macrobatch_idx); ++minibatch_idx) {
+                    const int global_minibatch_idx = macrobatch_idx * minibatches_per_macrobatch + minibatch_idx;
+                    reverse_dispatch_minibatch(global_minibatch_idx);
+                    if (macrobatch_idx + 1 < num_macrobatches &&
+                        minibatch_idx < num_minibatches_of(macrobatch_idx + 1)) {
+                        const int next_global_minibatch_idx = global_minibatch_idx + minibatches_per_macrobatch;
+                        preload_and_reverse_combine(next_global_minibatch_idx, global_minibatch_idx);
+                        replay_dispatch_minibatch(next_global_minibatch_idx);
+                    }
                 }
             }
         }
         return;
     }
+
+    // Prefix of routed work before global minibatch g.  The compact Wgrad
+    // contribution is derived from the device-built active-expert prefix, so
+    // every scheduled lane names real work.
+    auto minibatch_routed_task_prefix = [&](int global_minibatch_idx) {
+        const int replay_minibatches =
+            max(0, global_minibatch_idx - saved_macrobatch_num_minibatches);
+        return global_minibatch_idx * minibatch_routed_bwd_tasks +
+               replay_minibatches * minibatch_routed_replay_tasks +
+               3 * g.minibatch_expert_offsets[{global_minibatch_idx}] *
+                   wgrad_tile_tasks;
+    };
+    auto decode_minibatch_routed_task = [&](int idx, int &global_minibatch_idx,
+                                             int &minibatch_task_idx, bool &replayed) {
+        int begin = 0;
+        int end = num_minibatches;
+        while (begin < end) {
+            const int middle = begin + (end - begin) / 2;
+            if (minibatch_routed_task_prefix(middle + 1) <= idx)
+                begin = middle + 1;
+            else
+                end = middle;
+        }
+        global_minibatch_idx = begin;
+        minibatch_task_idx = idx - minibatch_routed_task_prefix(begin);
+        replayed = begin >= saved_macrobatch_num_minibatches;
+    };
+
+    // Maps one compact active-expert lane in a global minibatch to the dense
+    // (expert, output-tile) task index expected by the grouped GEMM.
+    auto minibatch_wgrad_dense_task = [&](int global_minibatch_idx, int lane_task_idx) {
+        const int lane = lane_task_idx / wgrad_tile_tasks;
+        const int tile = lane_task_idx % wgrad_tile_tasks;
+        const int minibatch_begin = global_minibatch_idx * g.minibatch_size;
+        const int minibatch_end = min(minibatch_begin + g.minibatch_size, num_tokens);
+        int expert_begin = 0;
+        int active_lane = 0;
+        for (int expert_idx = 0; expert_idx < num_local_experts; ++expert_idx) {
+            const int expert_end = expert_begin + g.tokens_per_expert[{expert_idx}];
+            if (max(expert_begin, minibatch_begin) < min(expert_end, minibatch_end)) {
+                if (active_lane == lane)
+                    return expert_idx * wgrad_tile_tasks + tile;
+                ++active_lane;
+            }
+            expert_begin = expert_end;
+        }
+        asm volatile("{trap;}");
+        return -1;
+    };
 
     // Swiglu (forward and backward) tasks are CTA-local, GEMM is not
     auto is_cta_local_task = [&](int compute_cluster_idx) {
@@ -187,6 +394,20 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         else if (compute_cluster_idx >= true_num_clusters - comm_clusters) return false;
 
         int idx = compute_cluster_idx - shared_tasks;
+        if constexpr (MINIBATCH_RELEASE) {
+            int global_minibatch_idx, minibatch_task_idx;
+            bool replayed;
+            decode_minibatch_routed_task(idx, global_minibatch_idx, minibatch_task_idx, replayed);
+            if (replayed) {
+                if (minibatch_task_idx < minibatch_routed_replay_tasks)
+                    return minibatch_task_idx >= 2 * minibatch_routed_gate_up_tasks;
+                minibatch_task_idx -= minibatch_routed_replay_tasks;
+            }
+            if (minibatch_task_idx >= minibatch_routed_bwd_tasks)
+                return false;
+            return minibatch_task_idx >= minibatch_routed_dgrad_down_tasks &&
+                   minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks;
+        }
         int macrobatch_num_minibatches, macrobatch_task_idx;
         if (idx < saved_macrobatch_tasks) {
             macrobatch_num_minibatches = saved_macrobatch_num_minibatches;
@@ -208,7 +429,6 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
     const int d_gate_up_row_block_ready_required_count = (config::MLP_Mb / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
     const index_gl *buffer_done = num_macrobatches > 1 ? &g.routed_buffers_done : nullptr;
-
     for (int task_iter = 0; cluster_idx >= 0 && cluster_idx < true_num_clusters; ++task_iter) {
         const int clc_stage = task_iter % config::CLC_PIPE_DEPTH;
         if (warpgroup::groupid() == config::NUM_CONSUMERS && warpgroup::warpid() == 1 && warp::elect_leader()) { // warp not used by the gemms
@@ -286,15 +506,32 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         } else {
             // Routed / replay tasks
             const int global_routed_task_idx = compute_cluster_idx - shared_tasks;
-            const bool replayed = global_routed_task_idx >= saved_macrobatch_tasks;
-            const int replayed_task_idx = global_routed_task_idx - saved_macrobatch_tasks;
-            const int macrobatch_idx = replayed ? 1 + replayed_task_idx / replayed_macrobatch_tasks : 0;
-            const int macrobatch_task_idx = replayed ? replayed_task_idx % replayed_macrobatch_tasks : global_routed_task_idx;
-            const int macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
-            const int num_replay_tasks = replayed ? macrobatch_num_minibatches * minibatch_routed_replay_tasks : 0;
+            bool replayed;
+            int global_minibatch_idx = 0;
+            int macrobatch_idx = 0;
+            int minibatch_idx = 0;
+            int macrobatch_task_idx = 0;
+            int macrobatch_num_minibatches = 0;
+            int num_replay_tasks = 0;
+            if constexpr (MINIBATCH_RELEASE) {
+                decode_minibatch_routed_task(global_routed_task_idx, global_minibatch_idx,
+                                             macrobatch_task_idx, replayed);
+                macrobatch_idx = global_minibatch_idx / minibatches_per_macrobatch;
+                minibatch_idx = global_minibatch_idx % minibatches_per_macrobatch;
+                macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
+                num_replay_tasks = replayed ? minibatch_routed_replay_tasks : 0;
+            } else {
+                replayed = global_routed_task_idx >= saved_macrobatch_tasks;
+                const int replayed_task_idx = global_routed_task_idx - saved_macrobatch_tasks;
+                macrobatch_idx = replayed ? 1 + replayed_task_idx / replayed_macrobatch_tasks : 0;
+                macrobatch_task_idx = replayed ? replayed_task_idx % replayed_macrobatch_tasks : global_routed_task_idx;
+                macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
+                num_replay_tasks = replayed ? macrobatch_num_minibatches * minibatch_routed_replay_tasks : 0;
+            }
 
             if (macrobatch_task_idx < num_replay_tasks) {
-                const int minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;
+                if constexpr (!MINIBATCH_RELEASE)
+                    minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;
                 const int minibatch_task_idx = macrobatch_task_idx % minibatch_routed_replay_tasks;
                 if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                     // Replay gate GEMM refreshes the routed activation.
@@ -328,10 +565,18 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       task_idx, cta_rank, 0, 0, smem_base_addr);
                 }
             } else {
-                const int num_routed_tasks = macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
+                const int num_routed_tasks = MINIBATCH_RELEASE
+                    ? minibatch_routed_bwd_tasks
+                    : macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
                 const int routed_task_idx = macrobatch_task_idx - num_replay_tasks;
-                const int minibatch_idx = routed_task_idx / minibatch_routed_bwd_tasks;
+                if constexpr (!MINIBATCH_RELEASE)
+                    minibatch_idx = routed_task_idx / minibatch_routed_bwd_tasks;
                 const int minibatch_task_idx = routed_task_idx % minibatch_routed_bwd_tasks;
+                const int current_wgrad_matrix_tasks = MINIBATCH_RELEASE
+                    ? (g.minibatch_expert_offsets[{global_minibatch_idx + 1}] -
+                       g.minibatch_expert_offsets[{global_minibatch_idx}]) *
+                          wgrad_tile_tasks
+                    : wgrad_matrix_tasks;
                 if (routed_task_idx < num_routed_tasks && minibatch_task_idx < minibatch_routed_dgrad_down_tasks) {
                     // Dgrad down: d_hidden_routed = d_y_routed @ w_routed_down
                     const int task_idx = minibatch_task_idx;
@@ -341,7 +586,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                                               0, 0, 0, shared_dgrad_down_tasks,
+                                               MINIBATCH_RELEASE ? macrobatch_idx * minibatches_per_macrobatch + minibatch_idx : macrobatch_idx,
+                                               smem_base_addr);
                 } else if (routed_task_idx < num_routed_tasks &&
                            minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
                     // Routed Swiglu backward
@@ -354,7 +601,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
                                       num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
                                       macrobatch_idx, minibatch_idx,
-                                      task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks, macrobatch_idx, smem_base_addr);
+                                      task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks,
+                                      MINIBATCH_RELEASE ? macrobatch_idx * minibatches_per_macrobatch + minibatch_idx : macrobatch_idx,
+                                      smem_base_addr);
                 } else if (routed_task_idx < num_routed_tasks) {
                     // Dgrad gate+up: d_x_routed = d_gate @ w_routed_gate + d_up @ w_routed_up
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
@@ -365,42 +614,59 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
-                } else if (routed_task_idx < num_routed_tasks + wgrad_matrix_tasks) {
+                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0,
+                                               MINIBATCH_RELEASE ? macrobatch_idx * minibatches_per_macrobatch + minibatch_idx : macrobatch_idx,
+                                               smem_base_addr);
+                } else if (routed_task_idx < num_routed_tasks + current_wgrad_matrix_tasks) {
                     // Wgrad down: d_w_routed_down += d_y_routed^T @ hidden_routed
-                    const int task_idx = routed_task_idx - num_routed_tasks;
-                    expert_grouped_gemm_kernel<false, true>(g.d_y_fp8_t_routed, g.hidden_fp8_t_routed, &g.d_y_sc_t_routed, &g.hidden_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
+                    const int lane_task_idx = routed_task_idx - num_routed_tasks;
+                    const int task_idx = MINIBATCH_RELEASE
+                        ? minibatch_wgrad_dense_task(global_minibatch_idx, lane_task_idx)
+                        : lane_task_idx;
+                    expert_grouped_gemm_kernel<false, true, false, MINIBATCH_RELEASE>(g.d_y_fp8_t_routed, g.hidden_fp8_t_routed, &g.d_y_sc_t_routed, &g.hidden_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_down, nullptr, nullptr,
                                                      g.tokens_per_expert, &g.d_y_routed_ready, replayed ? &g.replayed_hidden_ready : nullptr,
-                                                     nullptr, nullptr, nullptr, buffer_done,
+                                                     nullptr, nullptr, nullptr, MINIBATCH_RELEASE ? nullptr : buffer_done,
                                                      d_tt, a_sc_tt, b_sc_tt,
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
-                                                     g.d_y_shared.cols(), 0, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
-                } else if (routed_task_idx < num_routed_tasks + 2 * wgrad_matrix_tasks) {
+                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx,
+                                                     MINIBATCH_RELEASE ? minibatch_idx : 0, task_idx, cta_rank,
+                                                     g.d_y_shared.cols(), 0, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr,
+                                                     MINIBATCH_RELEASE ? &g.wgrad_read_consumed : nullptr);
+                } else if (routed_task_idx < num_routed_tasks + 2 * current_wgrad_matrix_tasks) {
                     // Wgrad gate: d_w_routed_gate += d_gate_routed^T @ x_routed
-                    const int task_idx = routed_task_idx - num_routed_tasks - wgrad_matrix_tasks;
-                    expert_grouped_gemm_kernel<false, true>(g.d_gate_fp8_t_routed, g.x_fp8_t_routed, &g.d_gate_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
+                    const int lane_task_idx = routed_task_idx - num_routed_tasks - current_wgrad_matrix_tasks;
+                    const int task_idx = MINIBATCH_RELEASE
+                        ? minibatch_wgrad_dense_task(global_minibatch_idx, lane_task_idx)
+                        : lane_task_idx;
+                    expert_grouped_gemm_kernel<false, true, false, MINIBATCH_RELEASE>(g.d_gate_fp8_t_routed, g.x_fp8_t_routed, &g.d_gate_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_gate, nullptr, nullptr,
                                                      g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
-                                                     &g.d_gate_up_ready, nullptr, nullptr, nullptr, buffer_done,
+                                                     &g.d_gate_up_ready, nullptr, nullptr, nullptr, MINIBATCH_RELEASE ? nullptr : buffer_done,
                                                      d_tt, a_sc_tt, b_sc_tt,
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
+                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx,
+                                                     MINIBATCH_RELEASE ? minibatch_idx : 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr,
+                                                     MINIBATCH_RELEASE ? &g.wgrad_read_consumed : nullptr);
                 } else {
                     // Wgrad up: d_w_routed_up += d_up_routed^T @ x_routed
-                    const int task_idx = routed_task_idx - num_routed_tasks - 2 * wgrad_matrix_tasks;
-                    expert_grouped_gemm_kernel<false, true>(g.d_up_fp8_t_routed, g.x_fp8_t_routed, &g.d_up_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
+                    const int lane_task_idx = routed_task_idx - num_routed_tasks - 2 * current_wgrad_matrix_tasks;
+                    const int task_idx = MINIBATCH_RELEASE
+                        ? minibatch_wgrad_dense_task(global_minibatch_idx, lane_task_idx)
+                        : lane_task_idx;
+                    expert_grouped_gemm_kernel<false, true, false, MINIBATCH_RELEASE>(g.d_up_fp8_t_routed, g.x_fp8_t_routed, &g.d_up_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_up, nullptr, nullptr,
                                                      g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
-                                                     &g.d_gate_up_ready, nullptr, nullptr, nullptr, buffer_done,
+                                                     &g.d_gate_up_ready, nullptr, nullptr, nullptr, MINIBATCH_RELEASE ? nullptr : buffer_done,
                                                      d_tt, a_sc_tt, b_sc_tt,
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
+                                                     num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx,
+                                                     MINIBATCH_RELEASE ? minibatch_idx : 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr,
+                                                     MINIBATCH_RELEASE ? &g.wgrad_read_consumed : nullptr);
                 }
             }
         }
@@ -417,6 +683,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
             everyone::tma::cluster::sync();
     }
 
+    if constexpr (MINIBATCH_RELEASE) {
+        // Bulk async groups are tracked per issuing thread.  Drain each
+        // thread's final outstanding reduce before the CTA enters the exit
+        // barrier; this does not serialize Wgrad tasks or macrobatches.
+        tma::store_async_wait();
+    }
     everyone::tma::cluster::sync();
 
     // CLC drain for no-op threadblocks
@@ -499,7 +771,8 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    bool use_minibatch_release
 ) {
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
@@ -555,11 +828,17 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     at::Tensor d_x_shared = at::empty({num_local_tokens, hidden_dim}, d_y_buffer.options());
     at::Tensor d_x_routed = at::empty({macrobatch_size, hidden_dim}, d_y_buffer.options());
     at::Tensor d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_gate = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
+    at::Tensor d_w_routed_gate = use_minibatch_release
+        ? at::zeros({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options())
+        : at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
     at::Tensor d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_up = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
+    at::Tensor d_w_routed_up = use_minibatch_release
+        ? at::zeros({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options())
+        : at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
     at::Tensor d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_down = at::empty({num_local_experts, hidden_dim, intermediate_dim}, d_y_buffer.options());
+    at::Tensor d_w_routed_down = use_minibatch_release
+        ? at::zeros({num_local_experts, hidden_dim, intermediate_dim}, d_y_buffer.options())
+        : at::empty({num_local_experts, hidden_dim, intermediate_dim}, d_y_buffer.options());
 
     // Counters
     at::Tensor d_y_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
@@ -569,8 +848,32 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     at::Tensor replayed_x_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
     at::Tensor replayed_gate_up_ready = at::zeros({routed_row_blocks * intermediate_dim_col_blocks}, tokens_per_expert.options());
     at::Tensor replayed_hidden_ready = at::zeros({routed_row_blocks}, tokens_per_expert.options());
-    at::Tensor routed_buffers_done = at::zeros({num_macrobatches}, tokens_per_expert.options());
-    at::Tensor router_weights_ready = at::zeros({num_macrobatches}, tokens_per_expert.options());
+    at::Tensor routed_buffers_done = at::zeros(
+        {use_minibatch_release ? num_global_minibatches : num_macrobatches}, tokens_per_expert.options());
+    at::Tensor router_weights_ready = at::zeros(
+        {use_minibatch_release ? num_global_minibatches : num_macrobatches}, tokens_per_expert.options());
+    at::Tensor wgrad_read_consumed = use_minibatch_release
+        ? at::zeros({num_global_minibatches}, tokens_per_expert.options())
+        : routed_buffers_done;
+    at::Tensor minibatch_expert_offsets = use_minibatch_release
+        ? at::empty({num_global_minibatches + 1}, tokens_per_expert.options())
+        : num_tokens;
+    if (use_minibatch_release) {
+        minibatch_expert_offsets_globals offsets_g {
+            .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
+            .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
+            .tokens_per_expert = kittens::py::tensor_to_gl<index_gl>(tokens_per_expert),
+            .num_local_experts = num_local_experts,
+            .minibatch_size = minibatch_size,
+            .capacity_minibatches = num_global_minibatches,
+        };
+        kittens::py::global_kernel<
+            minibatch_expert_offsets_config,
+            minibatch_expert_offsets_globals,
+            build_minibatch_expert_offsets_kernel>
+            <<<1, minibatch_expert_offsets_config::NUM_THREADS, 0,
+               at::cuda::getCurrentCUDAStream()>>>(offsets_g);
+    }
 
     globals_bwd g {
         .x_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(x),
@@ -640,6 +943,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
         .tokens_per_expert = kittens::py::tensor_to_gl<index_gl>(tokens_per_expert),
+        .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
         .router_weights_ready = kittens::py::tensor_to_gl<index_gl>(router_weights_ready),
         .d_y_routed_ready = kittens::py::tensor_to_gl<index_gl>(d_y_routed_ready),
         .d_hidden_ready = kittens::py::tensor_to_gl<index_gl>(d_hidden_ready),
@@ -649,27 +953,38 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .replayed_gate_up_ready = kittens::py::tensor_to_gl<index_gl>(replayed_gate_up_ready),
         .replayed_hidden_ready = kittens::py::tensor_to_gl<index_gl>(replayed_hidden_ready),
         .routed_buffers_done = kittens::py::tensor_to_gl<index_gl>(routed_buffers_done),
+        .wgrad_read_consumed = kittens::py::tensor_to_gl<index_gl>(wgrad_read_consumed),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
-        .minibatch_size = minibatch_size
+        .minibatch_size = minibatch_size,
+        .minibatch_release = use_minibatch_release ? 1 : 0
     };
 
-    if (swiglu_limit.has_value())
-        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
-    else
-        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
+    if (swiglu_limit.has_value()) {
+        if (use_minibatch_release)
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true, true>>(g);
+        else
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true, false>>(g);
+    } else {
+        if (use_minibatch_release)
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
+        else
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, false>>(g);
+    }
 
-    utils::zero_empty_routed_wgrads::globals g_zerw {
-        .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
-        .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
-        .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
-        .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
-        .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
-    };
+    if (!use_minibatch_release) {
+        utils::zero_empty_routed_wgrads::globals g_zerw {
+            .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
+            .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
+            .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
+            .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
+            .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
+        };
 
-    utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+        utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+    }
 
     return {d_x_shared, d_x_routed,
             d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
@@ -713,7 +1028,8 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    bool use_minibatch_release
 ) {
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
@@ -752,11 +1068,11 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     at::Tensor d_x_shared = at::empty({num_local_tokens, hidden_dim}, d_y_buffer.options());
     at::Tensor d_x_routed = at::empty({macrobatch_size, hidden_dim}, d_y_buffer.options());
     at::Tensor d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_gate = at::empty(w_routed_gate.sizes(), w_routed_gate.options());
+    at::Tensor d_w_routed_gate = use_minibatch_release ? at::zeros(w_routed_gate.sizes(), w_routed_gate.options()) : at::empty(w_routed_gate.sizes(), w_routed_gate.options());
     at::Tensor d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_up = at::empty(w_routed_up.sizes(), w_routed_up.options());
+    at::Tensor d_w_routed_up = use_minibatch_release ? at::zeros(w_routed_up.sizes(), w_routed_up.options()) : at::empty(w_routed_up.sizes(), w_routed_up.options());
     at::Tensor d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_down = at::empty(w_routed_down.sizes(), w_routed_down.options());
+    at::Tensor d_w_routed_down = use_minibatch_release ? at::zeros(w_routed_down.sizes(), w_routed_down.options()) : at::empty(w_routed_down.sizes(), w_routed_down.options());
 
     at::Tensor d_y_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
     at::Tensor d_hidden_ready = at::zeros({(shared_row_blocks + routed_row_blocks) * intermediate_dim_col_blocks}, tokens_per_expert.options());
@@ -765,8 +1081,32 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     at::Tensor replayed_x_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
     at::Tensor replayed_gate_up_ready = at::zeros({routed_row_blocks * intermediate_dim_col_blocks}, tokens_per_expert.options());
     at::Tensor replayed_hidden_ready = at::zeros({routed_row_blocks}, tokens_per_expert.options());
-    at::Tensor routed_buffers_done = at::zeros({num_macrobatches}, tokens_per_expert.options());
-    at::Tensor router_weights_ready = at::zeros({num_macrobatches}, tokens_per_expert.options());
+    at::Tensor routed_buffers_done = at::zeros(
+        {use_minibatch_release ? num_global_minibatches : num_macrobatches}, tokens_per_expert.options());
+    at::Tensor router_weights_ready = at::zeros(
+        {use_minibatch_release ? num_global_minibatches : num_macrobatches}, tokens_per_expert.options());
+    at::Tensor wgrad_read_consumed = use_minibatch_release
+        ? at::zeros({num_global_minibatches}, tokens_per_expert.options())
+        : routed_buffers_done;
+    at::Tensor minibatch_expert_offsets = use_minibatch_release
+        ? at::empty({num_global_minibatches + 1}, tokens_per_expert.options())
+        : num_tokens;
+    if (use_minibatch_release) {
+        minibatch_expert_offsets_globals offsets_g {
+            .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
+            .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
+            .tokens_per_expert = kittens::py::tensor_to_gl<index_gl>(tokens_per_expert),
+            .num_local_experts = num_local_experts,
+            .minibatch_size = minibatch_size,
+            .capacity_minibatches = num_global_minibatches,
+        };
+        kittens::py::global_kernel<
+            minibatch_expert_offsets_config,
+            minibatch_expert_offsets_globals,
+            build_minibatch_expert_offsets_kernel>
+            <<<1, minibatch_expert_offsets_config::NUM_THREADS, 0,
+               at::cuda::getCurrentCUDAStream()>>>(offsets_g);
+    }
 
     globals_bwd g {
         .x_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(x),
@@ -836,6 +1176,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
         .tokens_per_expert = kittens::py::tensor_to_gl<index_gl>(tokens_per_expert),
+        .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
         .router_weights_ready = kittens::py::tensor_to_gl<index_gl>(router_weights_ready),
         .d_y_routed_ready = kittens::py::tensor_to_gl<index_gl>(d_y_routed_ready),
         .d_hidden_ready = kittens::py::tensor_to_gl<index_gl>(d_hidden_ready),
@@ -845,27 +1186,38 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .replayed_gate_up_ready = kittens::py::tensor_to_gl<index_gl>(replayed_gate_up_ready),
         .replayed_hidden_ready = kittens::py::tensor_to_gl<index_gl>(replayed_hidden_ready),
         .routed_buffers_done = kittens::py::tensor_to_gl<index_gl>(routed_buffers_done),
+        .wgrad_read_consumed = kittens::py::tensor_to_gl<index_gl>(wgrad_read_consumed),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
-        .minibatch_size = minibatch_size
+        .minibatch_size = minibatch_size,
+        .minibatch_release = use_minibatch_release ? 1 : 0
     };
 
-    if (swiglu_limit.has_value())
-        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
-    else
-        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
+    if (swiglu_limit.has_value()) {
+        if (use_minibatch_release)
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true, true>>(g);
+        else
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true, false>>(g);
+    } else {
+        if (use_minibatch_release)
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
+        else
+            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, false>>(g);
+    }
 
-    utils::zero_empty_routed_wgrads::globals g_zerw {
-        .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
-        .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
-        .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
-        .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
-        .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
-    };
+    if (!use_minibatch_release) {
+        utils::zero_empty_routed_wgrads::globals g_zerw {
+            .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
+            .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
+            .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
+            .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
+            .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
+        };
 
-    utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+        utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+    }
 
     return {d_x_shared, d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed,
             d_hidden_shared, d_hidden_routed, d_y_routed,

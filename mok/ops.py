@@ -833,6 +833,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    minibatch_release: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -899,6 +900,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        minibatch_release:             bool
 
     Outputs:
         d_x_shared:          bfloat16 [num_local_tokens, hidden_size]
@@ -939,6 +941,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if (type(macrobatch_size) is not int or macrobatch_size <= 0
             or macrobatch_size % minibatch_size != 0):
         raise ValueError("macrobatch_size must be a positive multiple of minibatch_size")
+    if type(minibatch_release) is not bool:
+        raise TypeError("minibatch_release must be a bool")
     for pointer_name, pointers in (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -1073,6 +1077,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         x, x_ptrs, w_routed_gate, w_routed_gate_sc, w_routed_up, w_routed_up_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        minibatch_release,
     )
 
 
@@ -1113,6 +1118,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    minibatch_release: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1165,6 +1171,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        minibatch_release:             bool
 
     Outputs:
         d_x_shared:      bfloat16 [num_local_tokens, hidden_size]
@@ -1208,6 +1215,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         raise ValueError("minibatch_size must be positive and divisible by 256")
     if type(macrobatch_size) is not int or macrobatch_size <= 0 or macrobatch_size % minibatch_size != 0:
         raise ValueError("macrobatch_size must be a positive multiple of minibatch_size")
+    if type(minibatch_release) is not bool:
+        raise TypeError("minibatch_release must be a bool")
     pointer_lists = (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -1273,6 +1282,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         x, x_ptrs,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        minibatch_release,
     )
 
 

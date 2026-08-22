@@ -1844,6 +1844,7 @@ def test_dispatch_mlp_swiglu_combine_bwd_mxfp8(
         "num_comm_sms": 2,
         "macrobatch_size": 256,
         "minibatch_size": 256,
+        "minibatch_release": False,
     }
 
     outputs = dispatch_mlp_swiglu_combine_bwd_mxfp8(**valid_kwargs)
@@ -1879,6 +1880,7 @@ def test_dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ("communication SMs", {"num_comm_sms": 1}, ValueError),
         ("minibatch alignment", {"minibatch_size": 128}, ValueError),
         ("macrobatch multiple", {"macrobatch_size": 384}, ValueError),
+        ("minibatch release type", {"minibatch_release": 0}, TypeError),
         ("pointer EP size", {"x_ptrs": workspace.x_buffer_ptrs[:-1]}, ValueError),
         (
             "gradient output shape",
@@ -2187,6 +2189,7 @@ def test_dispatch_mlp_swiglu_combine_bwd_bf16(
         "num_comm_sms": 2,
         "macrobatch_size": 256,
         "minibatch_size": 256,
+        "minibatch_release": False,
     }
 
     outputs = dispatch_mlp_swiglu_combine_bwd_bf16(**valid_kwargs)
@@ -2222,6 +2225,7 @@ def test_dispatch_mlp_swiglu_combine_bwd_bf16(
         ("communication SMs", {"num_comm_sms": 1}, ValueError),
         ("minibatch alignment", {"minibatch_size": 128}, ValueError),
         ("macrobatch multiple", {"macrobatch_size": 384}, ValueError),
+        ("minibatch release type", {"minibatch_release": 0}, TypeError),
         ("pointer EP size", {"x_ptrs": workspace.x_buffer_ptrs[:-1]}, ValueError),
         (
             "gradient output shape",
