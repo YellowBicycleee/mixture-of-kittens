@@ -10,15 +10,13 @@ contains the first device-resident topology shared with
 * a compute-only depth-1 CLC suffix with the CUDA task decoder; and
 * GPU-scope monotonic counter acquire/release operations.
 
-The Gate/Up/SwiGLU/Down device collectives are the remaining data-path seam.
-Until those collectives are connected, ``_PersistentForwardBringupKernel`` is
-private and this file exposes only :func:`prepare_persistent_forward_bf16`,
-which validates and allocates the CUDA-compatible nine outputs and five
-counters.  In particular, this file must not be described as a functional or
-performance-comparable forward backend yet.
+The first compute risk slice below is one private, exact-shape Shared Gate
+collective.  Its bring-up wrapper exists only to cold-JIT and validate that
+device collective; it is not selected by the public backend.  The remaining
+collectives are still disconnected from ``_PersistentForwardBringupKernel``,
+and this file must not be described as a functional or performance-comparable
+forward backend yet.
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -29,8 +27,18 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass import Int32, Int64, Uint32
+from cutlass import BFloat16, Boolean, Float32, Int32, Int64, Uint32
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.utils import LayoutEnum
+
+import quack
+import quack.copy_utils as quack_copy_utils
+from quack.gemm_base import NamedBarrierGemm
+from quack.gemm_default_epi import GemmDefaultSm100
+from quack.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from quack.varlen_utils import VarlenArguments
 
 from ._tma_1d import tma_load_1d_raw, tma_store_1d_raw
 from .forward_contract import (
@@ -74,6 +82,27 @@ GEMM_D_BYTES = 3 * 128 * 32 * 2
 GEMM_ARENA_BYTES = GEMM_A_BYTES + GEMM_B_BYTES + GEMM_D_BYTES
 REUSABLE_ARENA_BYTES = max(COMM_ARENA_BYTES, GEMM_ARENA_BYTES)
 
+_REQUIRED_QUACK_VERSION = "0.6.4"
+if quack.__version__ != _REQUIRED_QUACK_VERSION:
+    raise RuntimeError(
+        "MoK's persistent CuTe DSL forward requires "
+        f"quack-kernels=={_REQUIRED_QUACK_VERSION}; got {quack.__version__}"
+    )
+
+_GATE_TILE_M = 256
+_GATE_TILE_N = 256
+_GATE_TILE_K = 64
+_GATE_CTA_M = 128
+_GATE_EPILOGUE_N = 32
+_GATE_AB_STAGES = 6
+_GATE_ACC_STAGES = 1
+_GATE_D_STAGES = 3
+_GATE_EPILOGUE_SUBTILES = _GATE_TILE_N // _GATE_EPILOGUE_N
+_GATE_MMA_WARP = 4
+_GATE_CLC_WARP = 5
+_GATE_BF16_IDLE_WARP = 6
+_GATE_AB_LOAD_WARP = 7
+
 
 @cute.struct
 class _PersistentSharedStorage:
@@ -96,7 +125,7 @@ class _PersistentSharedStorage:
         16,
     ]
 
-    # Kept explicit for the upcoming QuACK collective seam.  Six is the A/B
+    # Kept explicit for the QuACK collective seam.  Six is the A/B
     # load pipeline, while two is the accumulator full/empty pair.  The eight
     # N=32 epilogue subtiles are not an eight-stage output ring; CUDA reuses
     # three 128x32 BF16 D tiles.
@@ -227,6 +256,539 @@ def _counter_arrive_gpu(
 def _ceil_div_i32(value: Int32, divisor: Int32) -> Int32:
     return (value + divisor - Int32(1)) // divisor
 
+
+class _SharedGateTileCollective(GemmDefaultSm100):
+    """One device-resident 256x256x64 Shared Gate BF16 collective.
+
+    The collective owns no launch policy.  Its caller supplies the exact TMA
+    descriptors and the persistent kernel's shared storage, so the same device
+    body can be called from the future CLC task loop.
+    """
+
+    @classmethod
+    def _compute_stages(cls, *args, **kwargs):
+        del args, kwargs
+        return (
+            _GATE_ACC_STAGES,
+            _GATE_AB_STAGES,
+            _GATE_D_STAGES,
+            0,
+        )
+
+    def __init__(self) -> None:
+        super().__init__(
+            acc_dtype=Float32,
+            a_dtype=BFloat16,
+            mma_tiler_mnk=(_GATE_TILE_M, _GATE_TILE_N, _GATE_TILE_K),
+            cluster_shape_mnk=CLUSTER_SHAPE,
+            use_clc_persistence=False,
+            use_pdl=False,
+        )
+        # Preserve the CUDA persistent-kernel role map.  Warp 5 remains
+        # reserved for CLC, and warp 6 has no BF16-path work.
+        self.mma_warp_id = _GATE_MMA_WARP
+        self.scheduler_warp_id = _GATE_CLC_WARP
+        self.epi_load_warp_id = _GATE_BF16_IDLE_WARP
+        self.ab_load_warp_id = _GATE_AB_LOAD_WARP
+        assert self.epilog_warp_id == (0, 1, 2, 3)
+        assert self.threads_per_cta == THREADS_PER_CTA
+
+    def configure(
+        self,
+        mA_mk: cute.Tensor,
+        mB_nk: cute.Tensor,
+        mD_mn: cute.Tensor,
+    ) -> None:
+        """Resolve QuACK's fixed layouts without entering its host GEMM."""
+
+        self.a_dtype = mA_mk.element_type
+        self.b_dtype = mB_nk.element_type
+        self.a_mma_dtype = self.a_dtype
+        self.b_mma_dtype = self.b_dtype
+        self.a_unpack = False
+        self.b_unpack = False
+        self.a_smem_dtype = self.a_dtype
+        self.b_smem_dtype = self.b_dtype
+        self.d_dtype = mD_mn.element_type
+        self.c_dtype = None
+        self.sf_dtype = None
+        self.a_layout = LayoutEnum.from_tensor(mA_mk)
+        self.b_layout = LayoutEnum.from_tensor(mB_nk)
+        self.d_layout = LayoutEnum.from_tensor(mD_mn)
+        self.c_layout = None
+        self.a_major_mode = self.a_layout.mma_major_mode()
+        self.b_major_mode = self.b_layout.mma_major_mode()
+        self.varlen_m = False
+        self.varlen_k = False
+        self._setup_attributes(self.EpilogueArguments(), VarlenArguments())
+
+        assert self.a_dtype is BFloat16
+        assert self.b_dtype is BFloat16
+        assert self.d_dtype is BFloat16
+        assert self.use_2cta_instrs
+        assert self.cta_tile_shape_mnk == (
+            _GATE_CTA_M,
+            _GATE_TILE_N,
+            _GATE_TILE_K,
+        )
+        assert self.num_acc_stage == _GATE_ACC_STAGES
+        assert self.ab_stage == _GATE_AB_STAGES
+        assert self.epi_stage == _GATE_D_STAGES
+        assert cute.size(self.epi_tile[0]) == _GATE_CTA_M
+        assert cute.size(self.epi_tile[1]) == _GATE_EPILOGUE_N
+        assert cute.cosize(self.a_smem_layout_staged.outer) == (
+            _GATE_AB_STAGES * _GATE_CTA_M * _GATE_TILE_K
+        )
+        assert cute.cosize(self.b_smem_layout_staged.outer) == (
+            _GATE_AB_STAGES * _GATE_CTA_M * _GATE_TILE_K
+        )
+        assert cute.cosize(self.epi_smem_layout_staged.outer) == (
+            _GATE_D_STAGES * _GATE_CTA_M * _GATE_EPILOGUE_N
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        tma_atom_d: cute.CopyAtom,
+        mD_mn: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        epi_smem_layout: cute.ComposedLayout,
+        epi_tile: cute.Tile,
+        storage: _PersistentSharedStorage,
+        ready: cute.Tensor,
+    ) -> None:
+        """Execute the tile; this device collective never launches a kernel."""
+
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        thread = cute.arch.thread_idx()[0]
+        cta_rank = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        mma_tile_coord_v = cta_rank
+        is_leader_cta = mma_tile_coord_v == Int32(0)
+        is_two_cta = cute.size(tiled_mma.thr_id.shape) == 2
+
+        if warp == Int32(_GATE_AB_LOAD_WARP):
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            cpasync.prefetch_descriptor(tma_atom_d)
+
+        arena = storage.arena.data_ptr().align(
+            min_align=1024,
+        )
+        sA = cute.make_tensor(
+            cute.recast_ptr(
+                arena,
+                a_smem_layout.inner,
+                dtype=BFloat16,
+            ),
+            a_smem_layout.outer,
+        )
+        sB = cute.make_tensor(
+            cute.recast_ptr(
+                arena + GEMM_A_BYTES,
+                b_smem_layout.inner,
+                dtype=BFloat16,
+            ),
+            b_smem_layout.outer,
+        )
+        sD = cute.make_tensor(
+            cute.recast_ptr(
+                arena + GEMM_A_BYTES + GEMM_B_BYTES,
+                epi_smem_layout.inner,
+                dtype=BFloat16,
+            ),
+            epi_smem_layout.outer,
+        )
+
+        ab_pipeline = PipelineTmaUmma.create(
+            num_stages=_GATE_AB_STAGES,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                1,
+            ),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1,
+            ),
+            tx_count=self.num_tma_load_bytes,
+            barrier_storage=storage.gemm_ab_mbarriers.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        acc_pipeline = PipelineUmmaAsync.create(
+            num_stages=_GATE_ACC_STAGES,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                1,
+            ),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                len(self.epilog_warp_id) * CLUSTER_SIZE,
+            ),
+            barrier_storage=storage.gemm_acc_mbarriers.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+            elect_one_release=True,
+            syncwarp_before_release=False,
+        )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.TmemPtr),
+            num_threads=(
+                (len(self.epilog_warp_id) + 1) * cute.arch.WARP_SIZE
+            ),
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buffer.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=self.epilog_warp_id[0],
+            is_two_cta=is_two_cta,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbarrier.ptr,
+        )
+
+        pipeline_init_arrive(
+            cluster_shape_mn=cluster_layout_vmnk,
+            is_relaxed=True,
+        )
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        gA_mk = cute.local_tile(
+            mA_mk,
+            cute.select(self.mma_tiler, [0, 2]),
+            (Int32(0), None),
+        )
+        gB_nk = cute.local_tile(
+            mB_nk,
+            cute.select(self.mma_tiler, [1, 2]),
+            (Int32(0), None),
+        )
+        tCgA = thr_mma.partition_A(gA_mk)
+        tCgB = thr_mma.partition_B(gB_nk)
+        copy_A = quack_copy_utils.tma_get_block_copy_fn(
+            tma_atom_a,
+            src_tensor=tCgA,
+            dst_tensor=sA,
+            tma_multicast={
+                "cluster_shape": CLUSTER_SHAPE[:2],
+                "multicast_dim": "M",
+            },
+        )
+        copy_B = quack_copy_utils.tma_get_block_copy_fn(
+            tma_atom_b,
+            src_tensor=tCgB,
+            dst_tensor=sB,
+            tma_multicast={
+                "cluster_shape": CLUSTER_SHAPE[:2],
+                "multicast_dim": "N",
+            },
+        )
+
+        tile_coord_mnkl = (
+            cta_rank,
+            Int32(0),
+            Int32(0),
+            Int32(0),
+        )
+        copy_D, _, _ = self.epilog_gmem_copy_and_partition(
+            tma_atom_d,
+            mD_mn,
+            self.cta_tile_shape_mnk[:2],
+            epi_tile,
+            sD,
+            tile_coord_mnkl,
+        )
+
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, _GATE_ACC_STAGES)
+        )
+
+        if warp == Int32(_GATE_AB_LOAD_WARP):
+            ab_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                _GATE_AB_STAGES,
+            )
+            ab_producer_state = self.load_tma(
+                ab_pipeline,
+                ab_producer_state,
+                [copy_A, copy_B],
+                Int32(1),
+            )
+            ab_pipeline.producer_tail(ab_producer_state)
+
+        if warp == Int32(_GATE_MMA_WARP):
+            tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCrA = tiled_mma.make_fragment_A(sA)
+            tCrB = tiled_mma.make_fragment_B(sB)
+            tCtAcc = cute.make_tensor(
+                acc_tmem_ptr,
+                tCtAcc_fake.layout,
+            )[None, None, None, 0]
+            ab_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                _GATE_AB_STAGES,
+            )
+            acc_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer,
+                _GATE_ACC_STAGES,
+            )
+            (
+                _,
+                acc_producer_state,
+                tiled_mma,
+            ) = self.mma(
+                ab_pipeline,
+                acc_pipeline,
+                ab_consumer_state,
+                acc_producer_state,
+                tiled_mma,
+                tCrA,
+                tCrB,
+                tCtAcc,
+                Int32(1),
+                is_leader_cta,
+                cta_rank,
+            )
+            tmem_alloc_barrier.arrive()
+            acc_pipeline.producer_tail(acc_producer_state)
+
+        if warp < Int32(_GATE_MMA_WARP):
+            tmem.allocate(self.num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(
+                acc_tmem_ptr,
+                tCtAcc_fake.layout,
+            )
+
+            tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
+                self.epilog_tmem_copy_and_partition(
+                    thread,
+                    tCtAcc_base,
+                    epi_tile,
+                    is_two_cta,
+                )
+            )
+            tTR_rD = cute.make_rmem_tensor(
+                tTR_rAcc.shape,
+                self.acc_dtype,
+            )
+            tiled_copy_r2s, tRS_rD, tRS_sD = (
+                self.epilog_smem_store_and_partition(
+                    tiled_copy_t2r,
+                    self.d_layout,
+                    self.d_dtype,
+                    tTR_rD,
+                    sD,
+                    thread,
+                )
+            )
+            tTR_tAcc = tTR_tAcc_base[
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+            ]
+            tTR_tAcc = cute.group_modes(
+                tTR_tAcc,
+                3,
+                cute.rank(tTR_tAcc),
+            )
+            acc_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer,
+                _GATE_ACC_STAGES,
+            )
+            acc_pipeline.consumer_wait(acc_consumer_state)
+            epi_store_pipeline = self.make_epi_store_pipeline()
+            is_tma_warp = Boolean(warp == Int32(0))
+            epi_tile_shape = cute.zipped_divide(
+                cute.make_layout(self.cta_tile_shape_mnk[:2]),
+                epi_tile,
+            ).shape[1]
+            epi_tile_layout = cute.make_ordered_layout(
+                epi_tile_shape,
+                order=(0, 1),
+            )
+
+            for epi_idx in cutlass.range_constexpr(
+                _GATE_EPILOGUE_SUBTILES
+            ):
+                epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                self.epi_load_acc_subtile(
+                    tiled_copy_t2r,
+                    tiled_copy_r2s,
+                    tTR_tAcc,
+                    tTR_rAcc,
+                    tRS_rD,
+                    epi_coord,
+                    acc_pipeline,
+                    acc_consumer_state,
+                    _GATE_EPILOGUE_SUBTILES - 1,
+                )
+                rD_bf16 = tRS_rD.to(BFloat16)
+                if is_tma_warp:
+                    epi_store_pipeline.producer_acquire()
+                self.epilogue_barrier.arrive_and_wait()
+                epi_buffer = epi_idx % _GATE_D_STAGES
+                cute.copy(
+                    tiled_copy_r2s,
+                    rD_bf16,
+                    tRS_sD[None, None, None, epi_buffer],
+                )
+                cute.arch.fence_view_async_shared()
+                self.epilogue_barrier.arrive_and_wait()
+                if is_tma_warp:
+                    copy_D(
+                        src_idx=epi_buffer,
+                        dst_idx=epi_coord,
+                    )
+                    epi_store_pipeline.producer_commit()
+
+            acc_consumer_state.advance()
+            if is_tma_warp:
+                epi_store_pipeline.producer_tail()
+                with cute.arch.elect_one():
+                    _counter_arrive_gpu(
+                        ready,
+                        Int32(0),
+                        Int32(1),
+                    )
+
+            tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
+            tmem.free(acc_tmem_ptr)
+
+
+class _SharedGateTileBringupKernel:
+    """Private exact-shape host launcher for cold JIT and correctness only."""
+
+    def __init__(self) -> None:
+        self.collective = _SharedGateTileCollective()
+
+    @cute.jit
+    def __call__(
+        self,
+        mA_mk: cute.Tensor,
+        mB_nk: cute.Tensor,
+        mD_mn: cute.Tensor,
+        ready: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        collective = self.collective
+        collective.configure(mA_mk, mB_nk, mD_mn)
+
+        a_smem_layout = cute.slice_(
+            collective.a_smem_layout_staged,
+            (None, None, None, 0),
+        )
+        b_smem_layout = cute.slice_(
+            collective.b_smem_layout_staged,
+            (None, None, None, 0),
+        )
+        a_op = cpasync.CopyBulkTensorTileG2SOp(collective.cta_group)
+        b_op = cpasync.CopyBulkTensorTileG2SOp(collective.cta_group)
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            mA_mk,
+            a_smem_layout,
+            collective.mma_tiler,
+            collective.tiled_mma,
+            collective.cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            mB_nk,
+            b_smem_layout,
+            collective.mma_tiler,
+            collective.tiled_mma,
+            collective.cluster_layout_vmnk.shape,
+        )
+        tma_atom_d, tma_tensor_d = (
+            collective._make_tma_epi_atoms_and_tensors(
+                mD_mn,
+                collective.epi_smem_layout_staged,
+                collective.epi_tile,
+                op_type="store",
+            )
+        )
+        collective.num_tma_load_bytes = (
+            cute.size_in_bytes(BFloat16, a_smem_layout)
+            + cute.size_in_bytes(BFloat16, b_smem_layout)
+        ) * cute.size(collective.tiled_mma.thr_id.shape)
+
+        self.kernel(
+            collective.tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_d,
+            tma_tensor_d,
+            collective.cluster_layout_vmnk,
+            collective.a_smem_layout_staged,
+            collective.b_smem_layout_staged,
+            collective.epi_smem_layout_staged,
+            collective.epi_tile,
+            ready,
+        ).launch(
+            grid=(2, 1, 1),
+            block=(256, 1, 1),
+            cluster=(2, 1, 1),
+            smem=_PersistentSharedStorage.size_in_bytes(),
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        tma_atom_d: cute.CopyAtom,
+        mD_mn: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        epi_smem_layout: cute.ComposedLayout,
+        epi_tile: cute.Tile,
+        ready: cute.Tensor,
+    ) -> None:
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(_PersistentSharedStorage)
+        self.collective(
+            tiled_mma,
+            tma_atom_a,
+            mA_mk,
+            tma_atom_b,
+            mB_nk,
+            tma_atom_d,
+            mD_mn,
+            cluster_layout_vmnk,
+            a_smem_layout,
+            b_smem_layout,
+            epi_smem_layout,
+            epi_tile,
+            storage,
+            ready,
+        )
+
+
+_SHARED_GATE_TILE_BRINGUP = _SharedGateTileBringupKernel()
 
 class _PersistentForwardBringupKernel:
     """Private communication + scheduling core awaiting compute collectives."""
@@ -1129,6 +1691,60 @@ def _check_bf16_tensor(
         raise ValueError(f"{name} must be contiguous")
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}; got {tuple(tensor.shape)}")
+
+
+def _run_shared_gate_tile_bf16(
+    A: torch.Tensor,
+    W_nk: torch.Tensor,
+    out: torch.Tensor,
+    ready: torch.Tensor,
+) -> None:
+    """Cold-JIT bring-up entry for the private Shared Gate tile collective."""
+
+    device = A.device
+    if not A.is_cuda:
+        raise RuntimeError("Shared Gate tile bring-up requires CUDA")
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        raise RuntimeError("Shared Gate tile bring-up requires B300/SM103")
+    _check_bf16_tensor(
+        "A",
+        A,
+        (_GATE_TILE_M, _GATE_TILE_K),
+        device,
+    )
+    _check_bf16_tensor(
+        "W_nk",
+        W_nk,
+        (_GATE_TILE_N, _GATE_TILE_K),
+        device,
+    )
+    _check_bf16_tensor(
+        "out",
+        out,
+        (_GATE_TILE_M, _GATE_TILE_N),
+        device,
+    )
+    if (
+        ready.device != device
+        or not ready.is_cuda
+        or ready.dtype != torch.int32
+        or not ready.is_contiguous()
+        or tuple(ready.shape) != (1,)
+    ):
+        raise ValueError("ready must be contiguous int32 [1] on A.device")
+
+    cute_A = from_dlpack(A, assumed_align=16)
+    cute_W = from_dlpack(W_nk, assumed_align=16)
+    cute_out = from_dlpack(out, assumed_align=16)
+    cute_ready = from_dlpack(ready, assumed_align=16)
+    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    _SHARED_GATE_TILE_BRINGUP(
+        cute_A,
+        cute_W,
+        cute_out,
+        cute_ready,
+        stream,
+    )
 
 
 def prepare_persistent_forward_bf16(
