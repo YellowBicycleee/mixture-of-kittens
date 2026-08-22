@@ -61,7 +61,6 @@ TIMING_TOKENS = 20480
 WARMUPS = 50
 SAMPLES = 30
 DESIGN_BASE_COMMIT = "6f89aab04b092a3b3f8695735b84a62b2f05e5d9"
-BACKEND_SOURCE_COMMIT = "64123ac83d01c9a4ae8882d139750b569247ac2f"
 
 # Prior Qwen MoK selections.  Backward SMs only satisfy the shared config
 # contract; this runner never calls backward.
@@ -296,7 +295,7 @@ def make_case(
                     "minibatch": cuda_config.minibatch_size,
                 },
                 "mok_cutedsl_quack": {
-                    "fwd_comm_sms": "N/A (not used by this backend)",
+                    "fwd_comm_sms": cutedsl_config.fwd_num_comm_sms,
                     "minibatch": "N/A (contract validation only)",
                 },
             },
@@ -369,8 +368,8 @@ def main() -> None:
         payload = {
             "status": "PASS",
             "comparison": "MoK CUDA FWD vs MoK CuTe DSL + QuACK FWD",
+            "cutedsl_variant": "tiled peer TMA + QuACK tcgen05 GEMMs",
             "design_base_commit": DESIGN_BASE_COMMIT,
-            "backend_source_commit": BACKEND_SOURCE_COMMIT,
             "runtime_source_commit": os.environ.get(
                 "MOK_SOURCE_COMMIT", "not provided"
             ),

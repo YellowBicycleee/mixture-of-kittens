@@ -32,6 +32,53 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
         self.assertEqual(contract.decode_schedule_entry(7, route_idx), (37, route_idx))
         self.assertIsNone(contract.decode_schedule_entry(-1, 0x5A5A5A5A))
 
+    def test_dispatch_tasks_match_cuda_128_by_512_geometry(self) -> None:
+        self.assertEqual(contract.DISPATCH_ROW_CHUNK_BYTES, 1024)
+        self.assertEqual(
+            contract.DISPATCH_TILE_COLUMNS * 2,
+            contract.DISPATCH_ROW_CHUNK_BYTES,
+        )
+        self.assertEqual(
+            contract.DISPATCH_TILE_ROWS * contract.DISPATCH_ROW_CHUNK_BYTES,
+            131072,
+        )
+        self.assertEqual(contract.dispatch_task_geometry(4096), (32, 8, 256))
+        self.assertEqual(contract.dispatch_task_coordinates(0, 4096), (0, 0))
+        self.assertEqual(contract.dispatch_task_coordinates(7, 4096), (0, 3584))
+        self.assertEqual(contract.dispatch_task_coordinates(8, 4096), (128, 0))
+        self.assertEqual(
+            contract.dispatch_task_coordinates(255, 4096),
+            (3968, 3584),
+        )
+
+    def test_combine_tasks_match_cuda_16_by_1024_geometry(self) -> None:
+        self.assertEqual(contract.COMBINE_ROW_CHUNK_BYTES, 2048)
+        self.assertEqual(
+            contract.COMBINE_TILE_COLUMNS * 2,
+            contract.COMBINE_ROW_CHUNK_BYTES,
+        )
+        self.assertEqual(
+            contract.COMBINE_TILE_ROWS * contract.COMBINE_ROW_CHUNK_BYTES,
+            32768,
+        )
+        self.assertEqual(contract.combine_task_geometry(4096), (256, 4, 1024))
+        self.assertEqual(contract.combine_task_coordinates(0, 4096), (0, 0))
+        self.assertEqual(contract.combine_task_coordinates(3, 4096), (0, 3072))
+        self.assertEqual(contract.combine_task_coordinates(4, 4096), (16, 0))
+        self.assertEqual(
+            contract.combine_task_coordinates(1023, 4096),
+            (4080, 3072),
+        )
+        contract.validate_num_comm_sms(contract.DEFAULT_NUM_COMM_SMS)
+
+    def test_comm_geometry_rejects_partial_tiles_and_odd_pool(self) -> None:
+        with self.assertRaisesRegex(ValueError, "divisible by 128"):
+            contract.dispatch_task_geometry(129)
+        with self.assertRaisesRegex(ValueError, "divisible by 16"):
+            contract.combine_task_geometry(17)
+        with self.assertRaisesRegex(ValueError, "positive even"):
+            contract.validate_num_comm_sms(39)
+
     def test_macro_local_cu_seqlens_skew_and_zero_experts(self) -> None:
         # The macro starts inside expert 0, crosses a zero-row expert, consumes
         # all of expert 2, and ends inside expert 3.

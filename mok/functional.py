@@ -585,6 +585,7 @@ def forward(
                 macrobatch_size=config.macrobatch_size,
                 minibatch_size=config.minibatch_size,
                 swiglu_limit=swiglu_limit,
+                num_comm_sms=config.fwd_num_comm_sms,
             )
         else:
             raise ValueError("fwd_backend must be 'cuda' or 'cutedsl'")

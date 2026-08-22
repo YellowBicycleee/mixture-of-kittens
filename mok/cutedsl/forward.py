@@ -3,12 +3,10 @@
 MoK owns the CuTe DSL dispatch, SwiGLU, and combine kernels and keeps its
 reverse macro order and nine-tensor ABI.  QuACK 0.6.4 supplies the dense and
 variable-M ``tcgen05`` GEMMs.  The existing CUDA C++ megakernel remains MoK's
-default backend.  This revision still reads ``num_tokens`` to the host once,
-so its performance result remains ``N/A`` until that synchronization is
-removed and the full backend is measured.
+default backend.  This revision still reads ``num_tokens`` to the host once;
+the CUDA-Event benchmark intentionally includes that synchronization and the
+Python launch gaps in its ``functional.forward`` boundary.
 """
-
-from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Optional
@@ -18,10 +16,19 @@ import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int32, Int64, Uint16
+import cutlass.utils as utils
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
+from ._tma_1d import tma_load_1d_raw, tma_store_1d_raw
 from .forward_contract import (
+    COMBINE_ROW_CHUNK_BYTES,
+    COMBINE_TILE_COLUMNS,
+    COMBINE_TILE_ROWS,
+    DEFAULT_NUM_COMM_SMS,
+    DISPATCH_ROW_CHUNK_BYTES,
+    DISPATCH_TILE_COLUMNS,
+    DISPATCH_TILE_ROWS,
     EP_SIZE,
     HIDDEN_SIZE,
     INTERMEDIATE_SIZE,
@@ -29,15 +36,72 @@ from .forward_contract import (
     TOPK,
     macro_offsets,
     validate_fixed_forward_contract,
+    validate_num_comm_sms,
 )
 from .quack_gemm import routed_gemm, shared_gemm
 
 
 THREADS = 256
+COMM_THREADS = 256
+DISPATCH_WORKERS = DISPATCH_TILE_ROWS
+DISPATCH_COLUMN_TILES = HIDDEN_SIZE // DISPATCH_TILE_COLUMNS
+DISPATCH_CHUNK_BYTES = DISPATCH_ROW_CHUNK_BYTES
+COMBINE_WORKERS = COMBINE_TILE_ROWS
+COMBINE_COLUMN_TILES = HIDDEN_SIZE // COMBINE_TILE_COLUMNS
+COMBINE_CHUNK_BYTES = COMBINE_ROW_CHUNK_BYTES
+
+
+@cute.struct
+class _DispatchSharedStorage:
+    # CuTe DSL 4.6.2 resolves these fields at import time.  Keep the fixed-Qwen
+    # extents literal: 128 mbarriers and 128 x 512 x sizeof(BF16) bytes.
+    mbarriers: cute.struct.MemRange[cutlass.Int64, 128]
+    tile: cute.struct.Align[
+        cute.struct.MemRange[cutlass.Uint8, 131072],
+        128,
+    ]
+
+
+@cute.struct
+class _CombineSharedStorage:
+    # Single-stage form of CUDA's 16 x 1024 combine tile.  The CUDA path keeps
+    # seven such stages; this thin port establishes the exact task grain first.
+    mbarriers: cute.struct.MemRange[cutlass.Int64, 16]
+    tile: cute.struct.Align[
+        cute.struct.MemRange[cutlass.Uint8, 32768],
+        128,
+    ]
+
+
+@cute.jit
+def _select_peer_address(
+    peer_ptrs: list[cute.Pointer],
+    peer_rank: Int32,
+) -> Int64:
+    """Select one of the eight symmetric pointers once per row chunk."""
+
+    address = Int64(0)
+    if peer_rank == Int32(0):
+        address = peer_ptrs[0].toint()
+    elif peer_rank == Int32(1):
+        address = peer_ptrs[1].toint()
+    elif peer_rank == Int32(2):
+        address = peer_ptrs[2].toint()
+    elif peer_rank == Int32(3):
+        address = peer_ptrs[3].toint()
+    elif peer_rank == Int32(4):
+        address = peer_ptrs[4].toint()
+    elif peer_rank == Int32(5):
+        address = peer_ptrs[5].toint()
+    elif peer_rank == Int32(6):
+        address = peer_ptrs[6].toint()
+    else:
+        address = peer_ptrs[7].toint()
+    return address
 
 
 class _DispatchKernel:
-    """Pull routed BF16 rows from the eight symmetric x buffers."""
+    """Stage CUDA-shaped 128x512 peer tiles into the local routed ring."""
 
     @cute.jit
     def __call__(
@@ -45,80 +109,63 @@ class _DispatchKernel:
         peer_ptrs: list[cute.Pointer],
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
-        num_tokens: cute.Tensor,
         tokens_per_expert: cute.Tensor,
         macro_cu_seqlens: cute.Tensor,
         x_routed: cute.Tensor,
-        num_peer_tokens: cutlass.Constexpr,
         macro_offset: cutlass.Constexpr,
         macro_rows: cutlass.Constexpr,
+        num_comm_sms: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        peer_layout = cute.make_layout((num_peer_tokens * HIDDEN_SIZE,))
-        peers = []
-        for peer in cutlass.range_constexpr(EP_SIZE):
-            peers.append(cute.make_tensor(peer_ptrs[peer], peer_layout))
-        total_elements = cute.size(x_routed)
+        assert len(peer_ptrs) == EP_SIZE
         self.kernel(
-            peers,
+            peer_ptrs,
             schedule_peer_rank,
             schedule_peer_token_idx,
-            num_tokens,
             tokens_per_expert,
             macro_cu_seqlens,
             x_routed,
             macro_offset,
             macro_rows,
-            total_elements,
         ).launch(
-            grid=((total_elements + THREADS - 1) // THREADS, 1, 1),
-            block=(THREADS, 1, 1),
+            # Use the CUDA config value as the size of this persistent CTA
+            # worker pool.  CUDA does not guarantee one resident CTA per SM,
+            # so the value controls worker count rather than physical SM
+            # placement.
+            grid=(num_comm_sms, 1, 1),
+            block=(COMM_THREADS, 1, 1),
+            smem=_DispatchSharedStorage.size_in_bytes(),
             stream=stream,
         )
-
-    @cute.jit
-    def _load_peer(
-        self,
-        peers: list[cute.Tensor],
-        peer_rank: Int32,
-        flat_index: Int32,
-    ):
-        value = BFloat16(0.0)
-        if peer_rank == Int32(0):
-            value = peers[0][flat_index]
-        elif peer_rank == Int32(1):
-            value = peers[1][flat_index]
-        elif peer_rank == Int32(2):
-            value = peers[2][flat_index]
-        elif peer_rank == Int32(3):
-            value = peers[3][flat_index]
-        elif peer_rank == Int32(4):
-            value = peers[4][flat_index]
-        elif peer_rank == Int32(5):
-            value = peers[5][flat_index]
-        elif peer_rank == Int32(6):
-            value = peers[6][flat_index]
-        else:
-            value = peers[7][flat_index]
-        return value
 
     @cute.kernel
     def kernel(
         self,
-        peers: list[cute.Tensor],
+        peer_ptrs: list[cute.Pointer],
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
-        num_tokens: cute.Tensor,
         tokens_per_expert: cute.Tensor,
         macro_cu_seqlens: cute.Tensor,
         x_routed: cute.Tensor,
         macro_offset: cutlass.Constexpr,
         macro_rows: cutlass.Constexpr,
-        total_elements: cutlass.Constexpr,
     ):
         block = cute.arch.block_idx()[0]
         thread = cute.arch.thread_idx()[0]
-        linear = block * Int32(THREADS) + thread
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(_DispatchSharedStorage)
+        is_worker = thread < Int32(DISPATCH_WORKERS)
+        mbarrier = storage.mbarriers.data_ptr() + thread
+        row_chunk = (
+            storage.tile.data_ptr() + thread * Int32(DISPATCH_CHUNK_BYTES)
+        )
+
+        if is_worker:
+            cute.arch.mbarrier_init(mbarrier, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+
         if block == Int32(0) and thread == Int32(0):
             # If S[e] is the global exclusive expert prefix, QuACK needs
             # clamp(S[e] - macro_offset, 0, macro_rows) for this macro.
@@ -130,25 +177,72 @@ class _DispatchKernel:
                 local_end = cutlass.max(Int32(0), local_end)
                 local_end = cutlass.min(Int32(macro_rows), local_end)
                 macro_cu_seqlens[expert + 1] = local_end
-        if linear < Int32(total_elements):
-            local_row = linear // Int32(HIDDEN_SIZE)
-            column = linear - local_row * Int32(HIDDEN_SIZE)
-            global_row = local_row + Int32(macro_offset)
-            if global_row < num_tokens[0]:
+
+        # Match CUDA dispatch_kernel: one task is 128 routed rows x 512 BF16
+        # columns.  The 128 workers each move one contiguous 1024-byte row
+        # chunk.  Padding never reads its undefined route index.
+        task = block
+        total_tasks = Int32(
+            (macro_rows // DISPATCH_TILE_ROWS) * DISPATCH_COLUMN_TILES
+        )
+        task_stride = cute.arch.grid_dim()[0]
+        phase = Int32(0)
+        x_routed_base = x_routed.iterator.toint()
+        while task < total_tasks:
+            if is_worker:
+                row_tile = task // Int32(DISPATCH_COLUMN_TILES)
+                column_tile = task - row_tile * Int32(DISPATCH_COLUMN_TILES)
+                local_row = row_tile * Int32(DISPATCH_TILE_ROWS) + thread
+                global_row = local_row + Int32(macro_offset)
                 peer_rank = schedule_peer_rank[global_row]
                 if peer_rank >= Int32(0):
-                    # scheduler.cuh stores source_token * topk + k.  Dispatch
-                    # reads the source token row; combine below retains k.
                     route_idx = schedule_peer_token_idx[global_row]
                     source_token = route_idx // Int32(TOPK)
-                    flat_index = source_token * Int32(HIDDEN_SIZE) + column
-                    x_routed[local_row, column] = self._load_peer(
-                        peers, peer_rank, flat_index
+                    src_address = (
+                        _select_peer_address(peer_ptrs, peer_rank)
+                        + Int64(source_token) * Int64(HIDDEN_SIZE)
+                        * Int64(BFloat16.width // 8)
+                        + Int64(column_tile * Int32(DISPATCH_CHUNK_BYTES))
                     )
+                    # This worker is the sole producer and consumer of its
+                    # row mbarrier.  Wait for peer GMEM -> SMEM to complete
+                    # before the same bytes are submitted as SMEM -> ring.
+                    tma_load_1d_raw(
+                        row_chunk,
+                        src_address,
+                        mbarrier,
+                        Int32(DISPATCH_CHUNK_BYTES),
+                    )
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbarrier, Int32(DISPATCH_CHUNK_BYTES)
+                    )
+                    cute.arch.mbarrier_wait(mbarrier, phase)
+                    phase = phase ^ Int32(1)
                 else:
-                    # The 256-aligned expert padding has peer_rank == -1 and
-                    # an undefined token index.  Never read the latter.
-                    x_routed[local_row, column] = BFloat16(0.0)
+                    zero_words = cute.make_tensor(
+                        cute.recast_ptr(row_chunk, dtype=Uint32),
+                        cute.make_layout((DISPATCH_CHUNK_BYTES // 4,)),
+                    )
+                    for word in cutlass.range_constexpr(
+                        DISPATCH_CHUNK_BYTES // 4
+                    ):
+                        zero_words[word] = Uint32(0)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+
+                dst_address = (
+                    x_routed_base
+                    + Int64(local_row) * Int64(HIDDEN_SIZE)
+                    * Int64(BFloat16.width // 8)
+                    + Int64(column_tile * Int32(DISPATCH_CHUNK_BYTES))
+                )
+                tma_store_1d_raw(
+                    dst_address,
+                    row_chunk,
+                    Int32(DISPATCH_CHUNK_BYTES),
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+            task = task + task_stride
 
 
 class _SwiGLUKernel:
@@ -213,7 +307,7 @@ class _SwiGLUKernel:
 
 
 class _CombineKernel:
-    """Push routed outputs to the original rank's full route-index row."""
+    """Stage CUDA-shaped 16x1024 local tiles, then push them to peers."""
 
     @cute.jit
     def __call__(
@@ -221,85 +315,26 @@ class _CombineKernel:
         combine_ptrs: list[cute.Pointer],
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
-        num_tokens: cute.Tensor,
         y_routed: cute.Tensor,
         macro_offset: cutlass.Constexpr,
+        macro_rows: cutlass.Constexpr,
+        num_comm_sms: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        total_elements = cute.size(y_routed)
+        assert len(combine_ptrs) == EP_SIZE
         self.kernel(
             combine_ptrs,
             schedule_peer_rank,
             schedule_peer_token_idx,
-            num_tokens,
             y_routed,
             macro_offset,
-            total_elements,
+            macro_rows,
         ).launch(
-            grid=((total_elements + THREADS - 1) // THREADS, 1, 1),
-            block=(THREADS, 1, 1),
+            grid=(num_comm_sms, 1, 1),
+            block=(COMM_THREADS, 1, 1),
+            smem=_CombineSharedStorage.size_in_bytes(),
             stream=stream,
         )
-
-    @cute.jit
-    def _store_peer(
-        self,
-        peers: list[cute.Pointer],
-        peer_rank: Int32,
-        flat_index: Int64,
-        value: BFloat16,
-    ):
-        # CuTe DSL 4.6.2 rejects FP/BF16 system-scope ExtStore payloads.
-        # Store the identical 16-bit representation through an integer view.
-        bits = value.bitcast(Uint16)
-        if peer_rank == Int32(0):
-            cute.arch.store(
-                cute.recast_ptr(peers[0], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(1):
-            cute.arch.store(
-                cute.recast_ptr(peers[1], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(2):
-            cute.arch.store(
-                cute.recast_ptr(peers[2], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(3):
-            cute.arch.store(
-                cute.recast_ptr(peers[3], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(4):
-            cute.arch.store(
-                cute.recast_ptr(peers[4], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(5):
-            cute.arch.store(
-                cute.recast_ptr(peers[5], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        elif peer_rank == Int32(6):
-            cute.arch.store(
-                cute.recast_ptr(peers[6], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
-        else:
-            cute.arch.store(
-                cute.recast_ptr(peers[7], dtype=Uint16) + flat_index,
-                bits,
-                scope="sys",
-            )
 
     @cute.kernel
     def kernel(
@@ -307,31 +342,79 @@ class _CombineKernel:
         peers: list[cute.Pointer],
         schedule_peer_rank: cute.Tensor,
         schedule_peer_token_idx: cute.Tensor,
-        num_tokens: cute.Tensor,
         y_routed: cute.Tensor,
         macro_offset: cutlass.Constexpr,
-        total_elements: cutlass.Constexpr,
+        macro_rows: cutlass.Constexpr,
     ):
-        linear = cute.arch.block_idx()[0] * Int32(THREADS) + cute.arch.thread_idx()[0]
-        if linear < Int32(total_elements):
-            local_row = linear // Int32(HIDDEN_SIZE)
-            column = linear - local_row * Int32(HIDDEN_SIZE)
-            global_row = local_row + Int32(macro_offset)
-            if global_row < num_tokens[0]:
+        block = cute.arch.block_idx()[0]
+        thread = cute.arch.thread_idx()[0]
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(_CombineSharedStorage)
+        is_worker = thread < Int32(COMBINE_WORKERS)
+        mbarrier = storage.mbarriers.data_ptr() + thread
+        row_chunk = (
+            storage.tile.data_ptr() + thread * Int32(COMBINE_CHUNK_BYTES)
+        )
+
+        if is_worker:
+            cute.arch.mbarrier_init(mbarrier, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+
+        task = block
+        total_tasks = Int32(
+            (macro_rows // COMBINE_TILE_ROWS) * COMBINE_COLUMN_TILES
+        )
+        task_stride = cute.arch.grid_dim()[0]
+        phase = Int32(0)
+        y_routed_base = y_routed.iterator.toint()
+        while task < total_tasks:
+            if is_worker:
+                row_tile = task // Int32(COMBINE_COLUMN_TILES)
+                column_tile = task - row_tile * Int32(COMBINE_COLUMN_TILES)
+                local_row = row_tile * Int32(COMBINE_TILE_ROWS) + thread
+                global_row = local_row + Int32(macro_offset)
                 peer_rank = schedule_peer_rank[global_row]
                 if peer_rank >= Int32(0):
-                    # Unlike dispatch, combine addresses the complete route row
-                    # (source_token * topk + k), preserving every k slot.
                     route_idx = schedule_peer_token_idx[global_row]
-                    flat_index = (
-                        Int64(route_idx) * Int64(HIDDEN_SIZE) + Int64(column)
+                    src_address = (
+                        y_routed_base
+                        + Int64(local_row) * Int64(HIDDEN_SIZE)
+                        * Int64(BFloat16.width // 8)
+                        + Int64(column_tile * Int32(COMBINE_CHUNK_BYTES))
                     )
-                    self._store_peer(
-                        peers,
-                        peer_rank,
-                        flat_index,
-                        y_routed[local_row, column],
+                    tma_load_1d_raw(
+                        row_chunk,
+                        src_address,
+                        mbarrier,
+                        Int32(COMBINE_CHUNK_BYTES),
                     )
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbarrier, Int32(COMBINE_CHUNK_BYTES)
+                    )
+                    cute.arch.mbarrier_wait(mbarrier, phase)
+                    phase = phase ^ Int32(1)
+
+                    # Combine preserves k in route_idx and must promote the
+                    # byte offset to Int64 before the 100K/rank-sized product.
+                    dst_address = (
+                        _select_peer_address(peers, peer_rank)
+                        + Int64(route_idx) * Int64(HIDDEN_SIZE)
+                        * Int64(BFloat16.width // 8)
+                        + Int64(column_tile * Int32(COMBINE_CHUNK_BYTES))
+                    )
+                    tma_store_1d_raw(
+                        dst_address,
+                        row_chunk,
+                        Int32(COMBINE_CHUNK_BYTES),
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0)
+
+                # Padding neither reads its undefined route index nor writes a
+                # peer combine buffer.
+            task = task + task_stride
 
 
 _DISPATCH = _DispatchKernel()
@@ -375,6 +458,7 @@ def forward_bf16(
     macrobatch_size: int,
     minibatch_size: int,
     swiglu_limit: float | None,
+    num_comm_sms: int = DEFAULT_NUM_COMM_SMS,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -392,6 +476,7 @@ def forward_bf16(
         raise NotImplementedError("CuTe DSL forward currently supports unclamped SwiGLU only")
     if torch.cuda.get_device_capability(workspace.device) != (10, 3):
         raise NotImplementedError("CuTe DSL forward currently requires B300/SM103")
+    validate_num_comm_sms(num_comm_sms)
 
     validate_fixed_forward_contract(
         ep_size=workspace.ep_size,
@@ -486,13 +571,12 @@ def forward_bf16(
             x_ptrs,
             cute_schedule_rank,
             cute_schedule_route,
-            cute_num_tokens,
             cute_tokens_per_expert,
             cute_macro_cu_seqlens,
             cute_x_routed,
-            t,
             macro_offset,
             macro_rows,
+            num_comm_sms,
             stream,
         )
         routed_gemm(
@@ -525,9 +609,10 @@ def forward_bf16(
             combine_ptrs,
             cute_schedule_rank,
             cute_schedule_route,
-            cute_num_tokens,
             cute_y_routed,
             macro_offset,
+            macro_rows,
+            num_comm_sms,
             stream,
         )
 

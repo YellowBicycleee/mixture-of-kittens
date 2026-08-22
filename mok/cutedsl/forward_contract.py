@@ -18,6 +18,98 @@ NUM_GLOBAL_EXPERTS = 512
 NUM_LOCAL_EXPERTS = NUM_GLOBAL_EXPERTS // EP_SIZE
 TOPK = 10
 ROW_ALIGNMENT = 256
+DISPATCH_TILE_ROWS = 128
+DISPATCH_TILE_COLUMNS = 512
+DISPATCH_ROW_CHUNK_BYTES = DISPATCH_TILE_COLUMNS * 2  # BF16
+COMBINE_TILE_ROWS = 16
+COMBINE_TILE_COLUMNS = 1024
+COMBINE_ROW_CHUNK_BYTES = COMBINE_TILE_COLUMNS * 2  # BF16
+DEFAULT_NUM_COMM_SMS = 40
+
+
+def _task_geometry(
+    macro_rows: int,
+    *,
+    tile_rows: int,
+    tile_columns: int,
+) -> tuple[int, int, int]:
+    """Return ``(row_tiles, column_tiles, tasks)`` for one comm geometry."""
+
+    if type(macro_rows) is not int or macro_rows <= 0:
+        raise ValueError("macro_rows must be a positive integer")
+    if macro_rows % tile_rows:
+        raise ValueError(f"macro_rows must be divisible by {tile_rows}")
+    row_tiles = macro_rows // tile_rows
+    column_tiles = HIDDEN_SIZE // tile_columns
+    return row_tiles, column_tiles, row_tiles * column_tiles
+
+
+def _task_coordinates(
+    task_index: int,
+    macro_rows: int,
+    *,
+    tile_rows: int,
+    tile_columns: int,
+) -> tuple[int, int]:
+    """Decode one linear communication task into row and column offsets."""
+
+    row_tiles, column_tiles, tasks = _task_geometry(
+        macro_rows,
+        tile_rows=tile_rows,
+        tile_columns=tile_columns,
+    )
+    del row_tiles
+    if type(task_index) is not int or not 0 <= task_index < tasks:
+        raise ValueError("task_index is outside the communication task grid")
+    return (
+        task_index // column_tiles * tile_rows,
+        task_index % column_tiles * tile_columns,
+    )
+
+
+def dispatch_task_geometry(macro_rows: int) -> tuple[int, int, int]:
+    """CUDA-aligned dispatch geometry: 128 rows x 512 BF16 columns."""
+
+    return _task_geometry(
+        macro_rows,
+        tile_rows=DISPATCH_TILE_ROWS,
+        tile_columns=DISPATCH_TILE_COLUMNS,
+    )
+
+
+def dispatch_task_coordinates(task_index: int, macro_rows: int) -> tuple[int, int]:
+    return _task_coordinates(
+        task_index,
+        macro_rows,
+        tile_rows=DISPATCH_TILE_ROWS,
+        tile_columns=DISPATCH_TILE_COLUMNS,
+    )
+
+
+def combine_task_geometry(macro_rows: int) -> tuple[int, int, int]:
+    """CUDA-aligned single-stage combine geometry: 16 rows x 1024 columns."""
+
+    return _task_geometry(
+        macro_rows,
+        tile_rows=COMBINE_TILE_ROWS,
+        tile_columns=COMBINE_TILE_COLUMNS,
+    )
+
+
+def combine_task_coordinates(task_index: int, macro_rows: int) -> tuple[int, int]:
+    return _task_coordinates(
+        task_index,
+        macro_rows,
+        tile_rows=COMBINE_TILE_ROWS,
+        tile_columns=COMBINE_TILE_COLUMNS,
+    )
+
+
+def validate_num_comm_sms(num_comm_sms: int) -> None:
+    """Keep the CuTe fixed CTA pool compatible with CUDA's paired SM count."""
+
+    if type(num_comm_sms) is not int or num_comm_sms <= 0 or num_comm_sms % 2:
+        raise ValueError("num_comm_sms must be a positive even integer")
 
 
 def macro_offsets(num_tokens: int, macrobatch_size: int) -> tuple[int, ...]:
