@@ -1,4 +1,9 @@
-template <bool IS_SHARED, bool IS_WGRAD = false, bool IS_AB = false>
+template <
+    bool IS_SHARED,
+    bool IS_WGRAD = false,
+    bool IS_AB = false,
+    int LOAD_PIPE_DEPTH = config::MLP_LOAD_PIPE_DEPTH
+>
 static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const std::conditional_t<IS_SHARED, mlp_bf16_gl, routed_activation_gl> &a_gmem,
     const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, wgrad_bf16_gl, routed_activation_gl>,
@@ -43,6 +48,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const int buffer_done_index,
     const uint64_t smem_base_addr
 ) {
+    static_assert(LOAD_PIPE_DEPTH > 0);
+    static_assert(LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
+    static_assert(config::MLP_LOAD_PIPE_DEPTH + 1 + LOAD_PIPE_DEPTH <= 16);
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
                                       std::conditional_t<IS_WGRAD, mlp_bf16_t_tile, mlp_bf16_tile>>;
@@ -50,15 +58,29 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                                       std::conditional_t<IS_WGRAD || IS_AB, mlp_bf16_t_tile, mlp_bf16_tile>>;
     constexpr int MLP_Kb = USE_ROUTED_MXFP8 ? config::MLP_FP8_Kb : config::MLP_BF16_Kb;
 
-    auto (&a_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<a_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr);
-    auto (&b_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<b_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
-    auto (&a_sc_smem)[config::MLP_LOAD_PIPE_DEPTH]    = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
-    auto (&b_sc_smem)[config::MLP_LOAD_PIPE_DEPTH][2] = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH][2]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem));
+    auto (&a_smem)[LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<a_tile (*)[LOAD_PIPE_DEPTH]>(smem_base_addr);
+    auto (&b_smem)[LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<b_tile (*)[LOAD_PIPE_DEPTH]>(
+            smem_base_addr + sizeof(a_smem));
+    auto (&a_sc_smem)[LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<mlp_sc_tile (*)[LOAD_PIPE_DEPTH]>(
+            smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
+    auto (&b_sc_smem)[LOAD_PIPE_DEPTH][2] =
+        *reinterpret_cast<mlp_sc_tile (*)[LOAD_PIPE_DEPTH][2]>(
+            smem_base_addr + sizeof(a_smem) + sizeof(b_smem)
+            + sizeof(a_sc_smem));
     auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES] = *reinterpret_cast<mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>((smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
     auto &d_fp8_smem                                  = *reinterpret_cast<mlp_fp8_d_tile *>(&d_bf16_smem[2]);
     auto (&d_sc_smem)[2]                              = *reinterpret_cast<mlp_sc_tile (*)[2]>(reinterpret_cast<uint64_t>(&d_fp8_smem) + sizeof(d_fp8_smem));
     static_assert(config::MLP_NUM_BF16_D_TILES >= 3);
     static_assert(sizeof(mlp_fp8_d_tile) + 2 * sizeof(mlp_sc_tile) <= sizeof(mlp_bf16_d_tile));
+    static_assert(
+        sizeof(a_smem) + sizeof(b_smem)
+            + sizeof(a_sc_smem) + sizeof(b_sc_smem)
+            + config::MLP_NUM_BF16_D_TILES * sizeof(mlp_bf16_d_tile)
+            + 1023
+        <= config::DYNAMIC_SHARED_MEMORY);
 
     const int col_blocks = ((IS_WGRAD && !USE_ROUTED_MXFP8) || IS_AB) ? b_gmem.cols() / config::MLP_Nb : b_gmem.rows() / config::MLP_Nb;
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
@@ -163,7 +185,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     }
                     update_phasebit<1>(gemm_bitfield, input_ring);
-                    input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                    input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
                 }
             } else {
                 wait_for_a_operand();
@@ -178,7 +200,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     else
                         tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     update_phasebit<1>(gemm_bitfield, input_ring);
-                    input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                    input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
                 }
             }
         } else if (warpgroup::warpid() == 2 && warp::elect_leader()) {
@@ -192,7 +214,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                         tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                         update_phasebit<1>(gemm_bitfield, input_ring);
-                        input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                        input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
                     }
                 } else {
                     wait_for_a_operand();
@@ -205,7 +227,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                         tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr, {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb) + tile_coord.y * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                         update_phasebit<1>(gemm_bitfield, input_ring);
-                        input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                        input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
                     }
                 }
             }
@@ -250,7 +272,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     }
                 }
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
             }
             detail::tcgen05::commit<config::CLUSTER_SIZE>(gemm_outputs_arrived);
         }

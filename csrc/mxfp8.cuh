@@ -89,7 +89,14 @@ static __device__ __forceinline__ void dequantize_single_block(
     }
 }
 
-template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, int SRC_ROW_STRIDE = 128, bool SPLIT_PASSES = false, bool SCALE_ROWS = false>
+template <
+    bool RETURN_NORMAL,
+    bool RETURN_TRANSPOSED,
+    int SRC_ROW_STRIDE = 128,
+    bool SPLIT_PASSES = false,
+    bool SCALE_ROWS = false,
+    bool NORMAL_IN_PLACE = true
+>
 static __device__ __forceinline__ void quantize_tile(
     const globals::x_bf16_tile &x_bf16_tile,
     const globals::x_fp8_tile &x_fp8_tile,
@@ -159,15 +166,28 @@ static __device__ __forceinline__ void quantize_tile(
 
         uint32_t scale_word = 0;
         if (!transposed) {
-            // This writes FP8 output in place over the BF16 source, so it must load the whole tile up front
-            bf16_2 x_bf16_reg[NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
-            #pragma unroll
-            for (int j = 0; j < NUM_K_BLOCKS; j++)
-                load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j]);
-            group<TILE_SIZE / WARP_THREADS>::sync(barrier_id); // in-place writes may begin
-            #pragma unroll
-            for (int j = 0; j < NUM_K_BLOCKS; j++)
-                quantize_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j], scale_word);
+            if constexpr (NORMAL_IN_PLACE) {
+                // This writes FP8 output in place over the BF16 source, so it
+                // must load the whole tile before any output write begins.
+                bf16_2 x_bf16_reg[NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
+                #pragma unroll
+                for (int j = 0; j < NUM_K_BLOCKS; j++)
+                    load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j]);
+                group<TILE_SIZE / WARP_THREADS>::sync(barrier_id);
+                #pragma unroll
+                for (int j = 0; j < NUM_K_BLOCKS; j++)
+                    quantize_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j], scale_word);
+            } else {
+                // With disjoint source and normal-output buffers, stream one
+                // K block at a time to keep the BF16 register footprint low.
+                #pragma unroll 1
+                for (int j = 0; j < NUM_K_BLOCKS; j++) {
+                    const int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
+                    bf16_2 x_bf16_reg[PACKED_PER_K_BLOCK];
+                    load_k_block(k_block_idx, x_bf16_reg);
+                    quantize_k_block(k_block_idx, x_bf16_reg, scale_word);
+                }
+            }
         } else {
             #pragma unroll 1 // otherwise we get hundreds of register spills
             for (int j = 0; j < NUM_K_BLOCKS; j++) {

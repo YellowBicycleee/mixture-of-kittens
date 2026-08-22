@@ -58,7 +58,7 @@ using quant_sc_tile = mxfp8::globals::x_sc_tile;     // st_fp8e8m0<32, 16, false
 using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;
 
 // Global layouts
-using mlp_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile, swiglu_tile>;
+using mlp_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile, swiglu_tile, quant_bf16_tile>;
 using epi_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_d_tile, swiglu_tile, quant_bf16_tile>;
 using swiglu_bf16_gl = gl<bf16, 1, 1, -1, -1, swiglu_tile>;
 using wgrad_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_t_tile>;
@@ -139,16 +139,12 @@ struct globals_fwd {
         const int num_minibatches = (schedule_peer_rank.cols() + minibatch_size - 1) / minibatch_size; // across all macrobatches
         const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
-        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
-        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
-        const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
-        const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
-        const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
-        const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::SWIGLU_Nb);
+        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::SWIGLU_Nb);
         const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
         const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
-        const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
-        const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
+        const int shared_tasks = shared_gate_up_tasks + shared_down_tasks;
+        const int minibatch_tasks = minibatch_routed_gate_up_tasks + minibatch_routed_down_tasks;
         return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + num_comm_sms);
     }
 };

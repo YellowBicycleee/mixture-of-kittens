@@ -28,6 +28,7 @@ static constexpr bool USE_MXFP8 = ROUTED_PRECISION == RoutedPrecision::MXFP8;
 #include "dispatch_combine.cuh"
 #include "swiglu.cuh"
 #include "grouped_gemm.cuh"
+#include "fused_gate_up.cuh"
 
 #include "forward.cuh"
 #include "backward.cuh"
