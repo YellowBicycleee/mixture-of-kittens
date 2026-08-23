@@ -341,6 +341,10 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 static_cast<uint32_t>(__cvta_generic_to_shared(&up_q_fp8_smem));
             const uint32_t up_q_sc_addr =
                 static_cast<uint32_t>(__cvta_generic_to_shared(&up_q_sc_smem));
+            const uint32_t hidden_q_fp8_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&hidden_q_fp8_smem));
+            const uint32_t hidden_q_sc_addr =
+                static_cast<uint32_t>(__cvta_generic_to_shared(&hidden_q_sc_smem));
 
             auto load_tmem_bf16_block = [&](const int block, bf16_2 (&values)[16]) {
                 float2 tmp[16];
@@ -381,7 +385,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 }
             };
 
-            auto quantize_context_block = [&] (
+            auto quantize_row_block = [&] (
                 const bf16_2 (&values)[16], const uint32_t fp8_addr,
                 const int block, uint32_t &scale_word
             ) {
@@ -403,7 +407,10 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 }
             };
 
-            auto swiglu_block = [&](bf16_2 (&up_values)[16], const int block) {
+            auto swiglu_block = [&] (
+                bf16_2 (&up_values)[16], const int block,
+                uint32_t &hidden_scale_word
+            ) {
                 #pragma unroll
                 for (int j = 0; j < 16; ++j) {
                     bf16_2 gate_bf16;
@@ -432,8 +439,17 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                     gate = base_ops::mul::op<float2>(gate, up);
                     up_values[j] = __floats2bfloat162_rn(gate.x, gate.y);
                 }
-                store_hidden_block(up_values, block);
+                // Quantize the already-rounded BF16 hidden values while they
+                // are still in registers.  Only macro 0 needs the BF16 tile
+                // in shared memory later for transposed context generation.
+                quantize_row_block(
+                    up_values, hidden_q_fp8_addr, block, hidden_scale_word);
+                if (save_context)
+                    store_hidden_block(up_values, block);
             };
+
+            const uint32_t scale_offset =
+                (tile_row % 32) * 16 + (tile_row / 32) * 4;
 
             if (save_context) {
                 uint32_t gate_scale_word = 0;
@@ -445,18 +461,16 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
                     bf16_2 values[16];
                     load_tmem_bf16_block(block, values);
-                    quantize_context_block(
+                    quantize_row_block(
                         values, gate_q_fp8_addr, block, gate_scale_word);
                     store_hidden_block(values, block);
 
                     load_tmem_bf16_block(
                         block + config::SWIGLU_Nb / 32, values);
-                    quantize_context_block(
+                    quantize_row_block(
                         values, up_q_fp8_addr, block, up_scale_word);
                 }
 
-                const uint32_t scale_offset =
-                    (tile_row % 32) * 16 + (tile_row / 32) * 4;
                 move<int>::sts(
                     gate_q_sc_addr + scale_offset,
                     std::bit_cast<int>(gate_scale_word));
@@ -485,6 +499,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 // The context stores now overlap the second-pass Up loads and
                 // SwiGLU.  Release TMEM immediately after the final Up block
                 // reaches registers, before computing that block.
+                uint32_t hidden_scale_word = 0;
                 #pragma unroll 1
                 for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
                     bf16_2 up_values[16];
@@ -496,11 +511,15 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                         warpgroup::tma::cluster::arrive(
                             gemm_outputs_finished, 0);
                     }
-                    swiglu_block(up_values, block);
+                    swiglu_block(up_values, block, hidden_scale_word);
                 }
+                move<int>::sts(
+                    hidden_q_sc_addr + scale_offset,
+                    std::bit_cast<int>(hidden_scale_word));
             } else {
                 // Macro > 0 keeps V3b's single-pass path: no context is saved,
                 // so rereading Up would provide no overlap benefit.
+                uint32_t hidden_scale_word = 0;
                 #pragma unroll 1
                 for (int block = 0; block < config::SWIGLU_Nb / 32; ++block) {
                     bf16_2 values[16];
@@ -515,23 +534,19 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                         warpgroup::tma::cluster::arrive(
                             gemm_outputs_finished, 0);
                     }
-                    swiglu_block(values, block);
+                    swiglu_block(values, block, hidden_scale_word);
                 }
+                move<int>::sts(
+                    hidden_q_sc_addr + scale_offset,
+                    std::bit_cast<int>(hidden_scale_word));
             }
-
-            mxfp8::quantize_tile<
-                true, false, config::SWIGLU_Nb, false, false, false>(
-                hidden_bf16_smem,
-                hidden_q_fp8_smem, hidden_q_sc_smem,
-                hidden_q_fp8_smem, hidden_q_sc_smem, nullptr,
-                epilogue_group::laneid(), 1);
 
             if (save_context && epilogue_group::laneid() == 0)
                 tma::store_async_read_wait();
             // Context q/sc cannot be overwritten for hidden transpose until
-            // the elected lane has observed source-read completion.  This
-            // sync also publishes every hidden BF16 row for the transposed
-            // quantization pass.
+            // the elected lane has observed source-read completion.  The sync
+            // publishes hidden-normal q/sc for TMA and, when context is saved,
+            // every hidden BF16 row for the transposed quantization pass.
             epilogue_group::sync(1);
 
             if (save_context) {
