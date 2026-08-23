@@ -17,8 +17,7 @@ struct config {
     // Fused SwiGLU + MXFP8 quantize
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
-    static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE =
-        NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1;
+    static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE = 1;
     static constexpr int SWIGLU_FWD_PIPE_DEPTH = 3; // gate / up
     static constexpr int SWIGLU_BWD_PIPE_DEPTH = 2; // gate / up / d_hidden
 
