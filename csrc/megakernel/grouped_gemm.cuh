@@ -1,4 +1,8 @@
-template <bool IS_SHARED, bool IS_WGRAD = false, bool IS_AB = false, bool MINIBATCH_WGRAD = false>
+template <bool IS_SHARED, bool IS_WGRAD = false, bool IS_AB = false,
+          bool MINIBATCH_WGRAD_RANGE = false,
+          bool CONCURRENT_WGRAD_COMMIT = MINIBATCH_WGRAD_RANGE,
+          bool WGRAD_B_FULL_CONTEXT = false,
+          bool DGRAD_EXPERT_ROW_PREFIX = false>
 static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const std::conditional_t<IS_SHARED, mlp_bf16_gl, routed_activation_gl> &a_gmem,
     const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, wgrad_bf16_gl, routed_activation_gl>,
@@ -42,9 +46,12 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const int output_tile_ready_base_index,
     const int buffer_done_index,
     const uint64_t smem_base_addr,
-    const index_gl *wgrad_read_consumed = nullptr
+    const index_gl *wgrad_read_consumed = nullptr,
+    const index_gl *expert_row_offsets = nullptr // EP8 full-context: (E + 1,) routed-row prefix
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
+    static_assert(!WGRAD_B_FULL_CONTEXT || (IS_WGRAD && USE_ROUTED_MXFP8));
+    static_assert(!DGRAD_EXPERT_ROW_PREFIX || (!IS_SHARED && !IS_WGRAD));
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
                                       std::conditional_t<IS_WGRAD, mlp_bf16_t_tile, mlp_bf16_tile>>;
     using b_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
@@ -69,6 +76,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     int3 tile_coord = {-1, -1, -1};
     int k_start = 0, k_end = 0;
     bool is_first_wgrad_contribution = IS_SHARED;
+    bool is_only_wgrad_contribution = IS_SHARED;
     if constexpr (IS_WGRAD) {
         const int row_blocks = USE_ROUTED_MXFP8 ? a_gmem.rows() / config::MLP_Mb : a_gmem.cols() / config::MLP_Mb;
         if (task_idx >= 0) {
@@ -77,9 +85,13 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 k_end = a_gmem.rows();
             } else {
                 int expert_row_offset = 0;
-                for (int i = 0; i < expert_idx; ++i)
-                    expert_row_offset += tokens_per_expert[{i}];
-                if constexpr (MINIBATCH_WGRAD) {
+                if (expert_row_offsets != nullptr) {
+                    expert_row_offset = (*expert_row_offsets)[{expert_idx}];
+                } else {
+                    for (int i = 0; i < expert_idx; ++i)
+                        expert_row_offset += tokens_per_expert[{i}];
+                }
+                if constexpr (MINIBATCH_WGRAD_RANGE) {
                     const int minibatch_begin = global_minibatch_idx * minibatch_size;
                     const int minibatch_end = min(minibatch_begin + minibatch_size, num_tokens);
                     k_start = max(expert_row_offset, minibatch_begin);
@@ -89,6 +101,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     k_end = min(expert_row_offset + tokens_per_expert[{expert_idx}], min((macrobatch_idx + 1) * macrobatch_size, num_tokens));
                 }
                 is_first_wgrad_contribution = k_start == expert_row_offset;
+                is_only_wgrad_contribution =
+                    k_start == expert_row_offset &&
+                    k_end == expert_row_offset + tokens_per_expert[{expert_idx}];
             }
             if (k_start < k_end) {
                 const int2 swizzled = get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(row_blocks, col_blocks, IS_SHARED ? task_idx : task_idx % (row_blocks * col_blocks));
@@ -105,19 +120,73 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
         const int global_minibatch_routed_first_row_block = global_minibatch_idx * minibatch_routed_row_blocks;
-        int global_row_block_offset = 0;
-        for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
-            const int expert_row_blocks = tokens_per_expert[{expert_idx}] / config::MLP_Mb;
-            const int global_first_row_block = max(global_minibatch_routed_first_row_block, global_row_block_offset);
-            const int row_blocks = max(0, min(global_minibatch_routed_first_row_block + minibatch_routed_row_blocks, global_row_block_offset + expert_row_blocks) - global_first_row_block);
-            const int num_tasks = row_blocks * col_blocks;
-            if (task_idx < num_tasks) {
-                const int2 swizzled = get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
-                tile_coord = {global_first_row_block + swizzled.x - macrobatch_row_block_offset, swizzled.y, expert_idx};
-                break;
+        if constexpr (DGRAD_EXPERT_ROW_PREFIX) {
+            // Routed Dgrad tasks are expert-major, and every expert row count
+            // is MLP_Mb-aligned.  Map the task's linear row-block ordinal to
+            // its owning expert with an upper_bound over the existing prefix.
+            // E=64 (Qwen EP8) takes exactly the six unrolled comparisons; the
+            // loop below only preserves correctness for larger expert counts.
+            const int global_task_row_block =
+                global_minibatch_routed_first_row_block + task_idx / col_blocks;
+            if (global_task_row_block < num_tokens / config::MLP_Mb) {
+                const int global_task_row = global_task_row_block * config::MLP_Mb;
+                int expert_begin = 0;
+                int expert_end = b_gmem.depth() - 1;
+#pragma unroll
+                for (int step = 0; step < 6; ++step) {
+                    if (expert_begin < expert_end) {
+                        const int expert_mid = (expert_begin + expert_end) / 2;
+                        if ((*expert_row_offsets)[{expert_mid + 1}] <= global_task_row)
+                            expert_begin = expert_mid + 1;
+                        else
+                            expert_end = expert_mid;
+                    }
+                }
+                while (expert_begin < expert_end) {
+                    const int expert_mid = (expert_begin + expert_end) / 2;
+                    if ((*expert_row_offsets)[{expert_mid + 1}] <= global_task_row)
+                        expert_begin = expert_mid + 1;
+                    else
+                        expert_end = expert_mid;
+                }
+
+                const int expert_idx = expert_begin;
+                const int expert_first_row_block =
+                    (*expert_row_offsets)[{expert_idx}] / config::MLP_Mb;
+                const int expert_end_row_block =
+                    (*expert_row_offsets)[{expert_idx + 1}] / config::MLP_Mb;
+                const int global_first_row_block =
+                    max(global_minibatch_routed_first_row_block, expert_first_row_block);
+                const int row_blocks =
+                    min(global_minibatch_routed_first_row_block + minibatch_routed_row_blocks,
+                        expert_end_row_block) - global_first_row_block;
+                const int expert_task_idx =
+                    task_idx -
+                    (global_first_row_block - global_minibatch_routed_first_row_block) *
+                        col_blocks;
+                const int2 swizzled =
+                    get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(
+                        row_blocks, col_blocks, expert_task_idx);
+                tile_coord = {
+                    global_first_row_block + swizzled.x - macrobatch_row_block_offset,
+                    swizzled.y,
+                    expert_idx};
             }
-            task_idx -= num_tasks;
-            global_row_block_offset += expert_row_blocks;
+        } else {
+            int global_row_block_offset = 0;
+            for (int expert_idx = 0; expert_idx < b_gmem.depth(); ++expert_idx) {
+                const int expert_row_blocks = tokens_per_expert[{expert_idx}] / config::MLP_Mb;
+                const int global_first_row_block = max(global_minibatch_routed_first_row_block, global_row_block_offset);
+                const int row_blocks = max(0, min(global_minibatch_routed_first_row_block + minibatch_routed_row_blocks, global_row_block_offset + expert_row_blocks) - global_first_row_block);
+                const int num_tasks = row_blocks * col_blocks;
+                if (task_idx < num_tasks) {
+                    const int2 swizzled = get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(row_blocks, col_blocks, task_idx);
+                    tile_coord = {global_first_row_block + swizzled.x - macrobatch_row_block_offset, swizzled.y, expert_idx};
+                    break;
+                }
+                task_idx -= num_tasks;
+                global_row_block_offset += expert_row_blocks;
+            }
         }
     }
     if (tile_coord.z < 0) {
@@ -156,16 +225,23 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             }
         }
     };
-    // In the minibatch variant one routed Wgrad task owns exactly one
-    // (minibatch, expert, output-tile) intersection.  Once CTA-rank0 observes
-    // the cluster-wide TMA arrival for its final K block, both source operands
-    // have left the global ring and this minibatch slot may retire independently
-    // of the eventual dW reduction-add.
+    // A fine-retirement routed Wgrad task may span several minibatches.  Once
+    // CTA-rank0 observes the cluster-wide TMA arrival for the final K block in
+    // each minibatch/expert intersection, both source operands have left that
+    // global ring slot.  Retire the slot independently of MMA and dW commit.
     auto arrive_wgrad_read_consumed = [&](int idx) {
         if constexpr (IS_WGRAD && !IS_SHARED) {
             if (wgrad_read_consumed != nullptr) {
-                if (idx + 1 == iters_per_task)
-                    barrier_arrive(*wgrad_read_consumed, global_minibatch_idx);
+                const int k_block_end = k_start + (idx + 1) * MLP_Kb;
+                if (k_block_end == k_end || k_block_end % minibatch_size == 0) {
+                    const int consumed_minibatch = (k_block_end - 1) / minibatch_size;
+                    const int num_minibatches =
+                        (num_tokens + minibatch_size - 1) / minibatch_size;
+                    const int minibatches_per_macrobatch =
+                        macrobatch_size / minibatch_size;
+                    if (consumed_minibatch + minibatches_per_macrobatch < num_minibatches)
+                        barrier_arrive(*wgrad_read_consumed, consumed_minibatch);
+                }
             }
         }
     };
@@ -176,14 +252,18 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             if constexpr (IS_WGRAD) {
                 const int macrobatch_k_offset = macrobatch_idx * (macrobatch_size / MLP_Kb);
                 for (int idx = 0, k_block = k_start / MLP_Kb; idx < iters_per_task; ++idx, ++k_block) {
+                    const int a_k_block = k_block - macrobatch_k_offset;
+                    const int b_k_block = WGRAD_B_FULL_CONTEXT
+                        ? k_block
+                        : k_block - macrobatch_k_offset;
                     wait_for_wgrad_operands(idx, k_block * MLP_Kb);
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                     if constexpr (!USE_ROUTED_MXFP8) { // BF16 AtB: A/B tiles are K-major slices of normal token-major activations
-                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {k_block - macrobatch_k_offset, tile_coord.x * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {k_block - macrobatch_k_offset, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {a_k_block, tile_coord.x * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {b_k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     } else { // MXFP8 ABt: A/B are transpose-quantized activations with K = tokens
-                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, a_k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.y * 2 + cta_rank, b_k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     }
                     update_phasebit<1>(gemm_bitfield, input_ring);
                     input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
@@ -210,10 +290,14 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 if constexpr (IS_WGRAD) { // MXFP8 wgrad: both operands' scales follow the token-major layout
                     const int macrobatch_k_offset = macrobatch_idx * (macrobatch_size / MLP_Kb);
                     for (int idx = 0, k_block = k_start / MLP_Kb; idx < iters_per_task; ++idx, ++k_block) {
+                        const int a_k_block = k_block - macrobatch_k_offset;
+                        const int b_k_block = WGRAD_B_FULL_CONTEXT
+                            ? k_block
+                            : k_block - macrobatch_k_offset;
                         wait_for_wgrad_operands(idx, k_block * MLP_Kb);
                         wait(gemm_scales_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
-                        tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, a_k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, b_k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                         update_phasebit<1>(gemm_bitfield, input_ring);
                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                     }
@@ -306,11 +390,17 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
                 warpgroup::sync(1);
                 if constexpr (IS_WGRAD) {
-                    if constexpr (MINIBATCH_WGRAD) {
-                        // Independent minibatch Wgrad tasks may overlap.  TMA
-                        // add is race-free, but the cross-minibatch reduction
-                        // order is intentionally not deterministic.
-                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                    if constexpr (CONCURRENT_WGRAD_COMMIT) {
+                        if (is_only_wgrad_contribution) {
+                            // This segment is the sole writer of the expert's
+                            // dW tile, so it does not need a reduction-add.
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                        } else {
+                            // Split expert segments may overlap.  TMA add is
+                            // race-free but non-deterministic; the host
+                            // pre-zeroes only these experts.
+                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                        }
                     } else if (is_first_wgrad_contribution) {
                         warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
                     } else {

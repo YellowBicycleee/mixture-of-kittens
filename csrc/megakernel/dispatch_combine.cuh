@@ -1,4 +1,5 @@
-template <bool SCALE_ROWS = false>
+template <bool SCALE_ROWS = false,
+          bool ROUTER_WEIGHTS_FULL_CONTEXT = false>
 static __device__ __forceinline__ void dispatch_kernel(
     const activation_bf16_pgl &peer_buf,
     const routed_activation_gl &x_gmem,
@@ -23,6 +24,7 @@ static __device__ __forceinline__ void dispatch_kernel(
     const int buffer_ready_required_count,
     const uint64_t smem_base_addr
 ) {
+    static_assert(!ROUTER_WEIGHTS_FULL_CONTEXT || SCALE_ROWS);
     auto &token_chunks        = *reinterpret_cast<bf16 (*)[config::DISPATCH_Mb][config::DISPATCH_Nb]>(smem_base_addr);
     auto &x_fp8_tiles         = *reinterpret_cast<quant_fp8_tile (*)[config::DISPATCH_OUT_TILES]>(smem_base_addr + sizeof(token_chunks));
     auto &x_sc_tiles          = *reinterpret_cast<quant_sc_tile (*)[config::DISPATCH_OUT_TILES]>(smem_base_addr + sizeof(token_chunks) + sizeof(x_fp8_tiles));
@@ -68,7 +70,14 @@ static __device__ __forceinline__ void dispatch_kernel(
     __syncthreads();
 
     if constexpr (SCALE_ROWS) {
-        if (is_worker) router_weights_smem[tid] = peer_rank >= 0 ? router_weights->raw_ptr[row_idx + tid] : 0.0f;
+        if (is_worker) {
+            const int router_weight_row = ROUTER_WEIGHTS_FULL_CONTEXT
+                ? macrobatch_offset + row_idx + tid
+                : row_idx + tid;
+            router_weights_smem[tid] = peer_rank >= 0
+                ? router_weights->raw_ptr[router_weight_row]
+                : 0.0f;
+        }
     }
 
     if (peer_rank >= 0) {

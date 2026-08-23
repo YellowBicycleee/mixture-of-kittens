@@ -206,7 +206,8 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
     }
 }
 
-template <bool IS_SHARED, bool IS_CLAMPED>
+template <bool IS_SHARED, bool IS_CLAMPED,
+          bool SAVED_INPUTS_FULL_CONTEXT = false>
 static __device__ __forceinline__ void swiglu_bwd_kernel(
     const epi_bf16_gl &d_hidden_gmem,
     const std::conditional_t<IS_SHARED, swiglu_bf16_gl, routed_gate_up_gl> &gate_gmem,
@@ -245,6 +246,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
     const uint64_t smem_base_addr
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
+    static_assert(!SAVED_INPUTS_FULL_CONTEXT || USE_ROUTED_MXFP8);
     using gate_up_tile = std::conditional_t<USE_ROUTED_MXFP8, quant_fp8_tile, swiglu_tile>;
     using d_hidden_tile = std::conditional_t<USE_ROUTED_MXFP8, quant_bf16_tile, swiglu_tile>;
 
@@ -308,12 +310,19 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                 if (replayed_gate_up_tile_ready != nullptr) // replayed macrobatch: wait for the replayed gate/up GEMMs
                     barrier_wait(*replayed_gate_up_tile_ready, replayed_gate_up_tile_ready_base_index + parent_task_idx, 2 * config::CLUSTER_SIZE);
 
+                // d_hidden and all produced gradients stay in the macrobatch
+                // ring.  Only the forward-saved gate/up operands and immutable
+                // router-score cache may use their global routed-row address
+                // when the full MXFP8 context is kept.
+                const int saved_input_row = SAVED_INPUTS_FULL_CONTEXT
+                    ? row
+                    : row - macrobatch_row_block_offset;
                 tma::load_async(d_hidden_smem[stage], d_hidden_gmem, {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                tma::load_async(gate_smem[stage],     gate_gmem,     {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
-                tma::load_async(up_smem[stage],       up_gmem,       {row - macrobatch_row_block_offset, col}, swiglu_inputs_arrived[stage]);
+                tma::load_async(gate_smem[stage],     gate_gmem,     {saved_input_row, col}, swiglu_inputs_arrived[stage]);
+                tma::load_async(up_smem[stage],       up_gmem,       {saved_input_row, col}, swiglu_inputs_arrived[stage]);
                 if constexpr (USE_ROUTED_MXFP8) {
-                    tma::load_async(gate_sc_smem[stage], *gate_sc_gmem, {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
-                    tma::load_async(up_sc_smem[stage],   *up_sc_gmem,   {row - macrobatch_row_block_offset, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(gate_sc_smem[stage], *gate_sc_gmem, {saved_input_row, col, 0, 0}, swiglu_inputs_arrived[stage]);
+                    tma::load_async(up_sc_smem[stage],   *up_sc_gmem,   {saved_input_row, col, 0, 0}, swiglu_inputs_arrived[stage]);
                 }
             }
         }
@@ -343,7 +352,10 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                 const int global_token_idx = row * config::SWIGLU_Mb + tile_row;
                 const int local_token_idx = (row - macrobatch_row_block_offset) * config::SWIGLU_Mb + tile_row;
                 const int peer_rank = (*schedule_peer_rank)[{global_token_idx}];
-                const float router_weight = router_weights->raw_ptr[local_token_idx];
+                const int router_weight_row = SAVED_INPUTS_FULL_CONTEXT
+                    ? global_token_idx
+                    : local_token_idx;
+                const float router_weight = router_weights->raw_ptr[router_weight_row];
                 const float inv_router_weight = router_weight > 0.0f ? 1.0f / router_weight : 0.0f;
                 float router_grad_partial = 0.0f;
 

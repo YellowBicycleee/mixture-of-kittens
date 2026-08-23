@@ -874,17 +874,17 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         w_shared_down:                 bfloat16 [hidden_size, intermediate_size]
         w_routed_down_T:               float8_e4m3fn [num_local_experts, intermediate_size, hidden_size]
         w_routed_down_T_sc:            uint8 [num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16]
-        x_fp8_t_routed:                float8_e4m3fn [hidden_size, macrobatch_size]
-        x_sc_t_routed:                 uint8 [hidden_size // 128, macrobatch_size // 128, 32, 16]
+        x_fp8_t_routed:                float8_e4m3fn [hidden_size, context_size]
+        x_sc_t_routed:                 uint8 [hidden_size // 128, context_size // 128, 32, 16]
         gate_shared:                   bfloat16 [num_local_tokens, intermediate_size]
-        gate_fp8_routed:               float8_e4m3fn [macrobatch_size, intermediate_size]
-        gate_sc_routed:                uint8 [macrobatch_size // 128, intermediate_size // 128, 32, 16]
+        gate_fp8_routed:               float8_e4m3fn [context_size, intermediate_size]
+        gate_sc_routed:                uint8 [context_size // 128, intermediate_size // 128, 32, 16]
         up_shared:                     bfloat16 [num_local_tokens, intermediate_size]
-        up_fp8_routed:                 float8_e4m3fn [macrobatch_size, intermediate_size]
-        up_sc_routed:                  uint8 [macrobatch_size // 128, intermediate_size // 128, 32, 16]
+        up_fp8_routed:                 float8_e4m3fn [context_size, intermediate_size]
+        up_sc_routed:                  uint8 [context_size // 128, intermediate_size // 128, 32, 16]
         hidden_shared:                 bfloat16 [num_local_tokens, intermediate_size]
-        hidden_fp8_t_routed:           float8_e4m3fn [intermediate_size, macrobatch_size]
-        hidden_sc_t_routed:            uint8 [intermediate_size // 128, macrobatch_size // 128, 32, 16]
+        hidden_fp8_t_routed:           float8_e4m3fn [intermediate_size, context_size]
+        hidden_sc_t_routed:            uint8 [intermediate_size // 128, context_size // 128, 32, 16]
         x:                             bfloat16 [num_local_tokens, hidden_size]
         x_ptrs:                        list[int] [ep_size]
         w_routed_gate:                 float8_e4m3fn [num_local_experts, intermediate_size, hidden_size]
@@ -974,9 +974,23 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
-    mb_i_sc = (macrobatch_size // 128, intermediate_size // 128, 32, 16)
-    i_mb_sc = (intermediate_size // 128, macrobatch_size // 128, 32, 16)
-    h_mb_sc = (hidden_size // 128, macrobatch_size // 128, 32, 16)
+    if x_fp8_t_routed.ndim != 2 or x_fp8_t_routed.shape[0] != hidden_size:
+        raise ValueError("x_fp8_t_routed must have shape (hidden_size, context_size)")
+    context_size = x_fp8_t_routed.shape[1]
+    if context_size < macrobatch_size or context_size % 128 != 0:
+        raise ValueError(
+            "MXFP8 context_size must be at least macrobatch_size and divisible by 128"
+        )
+    full_context = context_size > macrobatch_size
+    if full_context and not minibatch_release:
+        raise ValueError(
+            "MXFP8 full-context/no-replay requires minibatch_release=True"
+        )
+    if full_context and ep_size != 8:
+        raise ValueError("MXFP8 full-context/no-replay proof currently requires EP8")
+    context_i_sc = (context_size // 128, intermediate_size // 128, 32, 16)
+    i_context_sc = (intermediate_size // 128, context_size // 128, 32, 16)
+    h_context_sc = (hidden_size // 128, context_size // 128, 32, 16)
     e_i_h_sc = (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)
     e_h_i_sc = (num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16)
     expected_shapes = (
@@ -995,17 +1009,17 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ("w_routed_down_T", w_routed_down_T,
          (num_local_experts, intermediate_size, hidden_size)),
         ("w_routed_down_T_sc", w_routed_down_T_sc, e_i_h_sc),
-        ("x_fp8_t_routed", x_fp8_t_routed, (hidden_size, macrobatch_size)),
-        ("x_sc_t_routed", x_sc_t_routed, h_mb_sc),
+        ("x_fp8_t_routed", x_fp8_t_routed, (hidden_size, context_size)),
+        ("x_sc_t_routed", x_sc_t_routed, h_context_sc),
         ("gate_shared", gate_shared, (num_local_tokens, intermediate_size)),
-        ("gate_fp8_routed", gate_fp8_routed, (macrobatch_size, intermediate_size)),
-        ("gate_sc_routed", gate_sc_routed, mb_i_sc),
+        ("gate_fp8_routed", gate_fp8_routed, (context_size, intermediate_size)),
+        ("gate_sc_routed", gate_sc_routed, context_i_sc),
         ("up_shared", up_shared, (num_local_tokens, intermediate_size)),
-        ("up_fp8_routed", up_fp8_routed, (macrobatch_size, intermediate_size)),
-        ("up_sc_routed", up_sc_routed, mb_i_sc),
+        ("up_fp8_routed", up_fp8_routed, (context_size, intermediate_size)),
+        ("up_sc_routed", up_sc_routed, context_i_sc),
         ("hidden_shared", hidden_shared, (num_local_tokens, intermediate_size)),
-        ("hidden_fp8_t_routed", hidden_fp8_t_routed, (intermediate_size, macrobatch_size)),
-        ("hidden_sc_t_routed", hidden_sc_t_routed, i_mb_sc),
+        ("hidden_fp8_t_routed", hidden_fp8_t_routed, (intermediate_size, context_size)),
+        ("hidden_sc_t_routed", hidden_sc_t_routed, i_context_sc),
         ("w_routed_gate", w_routed_gate,
          (num_local_experts, intermediate_size, hidden_size)),
         ("w_routed_gate_sc", w_routed_gate_sc, e_i_h_sc),

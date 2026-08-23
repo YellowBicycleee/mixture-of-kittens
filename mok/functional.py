@@ -719,8 +719,18 @@ def backward(
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
 
+    full_context_no_replay = (
+        isinstance(routed_gate_weights, tuple)
+        and isinstance(forward_context.x_routed, tuple)
+        and forward_context.x_routed[0].shape[1] > config.macrobatch_size
+    )
+    x_for_backward = x if full_context_no_replay else workspace.x_buffer
+
     workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this
-    workspace.x_buffer.copy_(x)                            # TODO: we can remove this
+    if not full_context_no_replay:
+        # The symmetric x buffer only feeds routed Replay.  FULL_CONTEXT
+        # compiles Replay out and uses x locally for shared Wgrad.
+        workspace.x_buffer.copy_(x)
     workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
@@ -751,7 +761,7 @@ def backward(
             forward_context.gate_shared, gate_fp8_routed, gate_sc_routed,
             forward_context.up_shared, up_fp8_routed, up_sc_routed,
             forward_context.hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-            workspace.x_buffer, workspace.x_buffer_ptrs,
+            x_for_backward, workspace.x_buffer_ptrs,
             routed_gate_weights_fp8, routed_gate_weights_sc,
             routed_up_weights_fp8, routed_up_weights_sc,
             schedule.peer_rank, schedule.peer_token_idx,

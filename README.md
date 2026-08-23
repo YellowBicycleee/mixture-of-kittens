@@ -89,16 +89,57 @@ With the functional API, MoK is simple to use: call `schedule(...)` once to buil
 
 ### Config
 
-MoK exposes several settings that can affect the performance of MoE execution. Because optimal values depend heavily on the workload, you should tune and sweep them before using MoK in production.
+MoK exposes several settings that affect computation/communication overlap.
+Optimal values depend on the model, routing distribution, EP size, precision,
+GPU, and token count, so tune them together on the actual workload. Do not use
+a fixed minibatch or communication-SM range as a universal recommendation.
 
-- `fwd_num_comm_sms`: the number of communication SMs during forward. We recommend values between 4 and 52.
-- `bwd_num_comm_sms`: the number of communication SMs during backward. We recommend values between 4 and 52.
-- `minibatch_size`: the granularity of computation–communication overlap. This is an important parameter in MoK, and you must tune it properly to get optimal performance. We recommend values between 2048 and 16384.
-- `macrobatch_size`: the token ring buffer size. A larger value can reduce ring buffer reuse, but is not always faster. Sweep this jointly with `bwd_schedule` using the actual routed-token count and expert distribution, and choose a value that fits the available GPU memory.
-- `bwd_schedule`: the backward scheduling mode. `"macrobatch"` (the default) commits routed weight-gradient work in deterministic macrobatch order. The opt-in `"minibatch"` mode releases dependent backward work after each minibatch, enabling finer-grained overlap. Independent minibatches can then accumulate into the same routed weight gradients in different orders, so this mode is not bitwise deterministic. Its performance is workload-dependent and can regress when the ring is large enough to avoid frequent reuse; sweep both backward modes with the actual routed-token count and expert distribution instead of relying on a fixed threshold. All ranks in an expert-parallel group must use the same value.
-- `schedule_capacity_multiplier`: defaults to 0.5. This should be set to the worst-case fraction of tokens routed to a single rank. Setting it to 1 assumes the absolute worst case (all tokens routed to one rank) but adds kernel scheduling overhead (due to expert padding, the actual worst case is slightly above 1.0). Ideally, use a higher value during the first steps of training when expert imbalance is bad, then reduce it to around 0.5 in later steps. Note that decreasing this value does not save GPU memory meaningfully, as the schedule table is at most a few megabytes.
+- `fwd_num_comm_sms` (default: `40`): positive even communication-SM count used
+  by forward. Tune it against forward latency and leave at least one compute
+  SM.
+- `bwd_num_comm_sms` (default: `28`): positive even communication-SM count used
+  by backward. Tune it independently from the forward count and leave at least
+  one compute SM.
+- `minibatch_size` (default: `4096`): computation/communication overlap
+  granularity. It must be positive, divisible by 256, and divide the
+  `macrobatch_size` used by that call. Sweep legal divisors instead of assuming
+  that finer is always faster.
+- `macrobatch_size` (default: `131072`): physical routed ring capacity. Larger
+  rings reduce reuse and legacy routed-forward replay, while smaller rings may
+  improve overlap and reduce backward-gradient buffer capacity. Sweep it
+  jointly with `minibatch_size`, communication-SM counts, and `bwd_schedule`,
+  and include the full memory footprint in the decision.
+- `bwd_schedule` (default: `"macrobatch"`): the default preserves deterministic
+  weight-gradient accumulation order. `"minibatch"` enables fine ring-slot
+  retirement and can overlap dependent work sooner, but split-expert
+  weight-gradient partials may be added in a different order, so it is not
+  bitwise deterministic. All ranks in an expert-parallel group must use the
+  same setting.
+- `schedule_capacity_multiplier` (default: `0.5`): positive finite capacity
+  factor for the routed schedule. Size it for the worst expected expert
+  imbalance; lowering it does not materially reduce the main activation or
+  gradient-buffer footprint.
+- `all_gather_top_experts_chunk_bytes` (default: `2048`): positive multiple of
+  16 that divides one rank's route-buffer bytes and fits the device's dynamic
+  shared-memory limit. Keep the default unless the routing all-gather is being
+  tuned explicitly.
 
-You can set these values when creating the `MoKConfig` dataclass, which you pass to all functional-layer functions.
+The same `MoKConfig` can be used for ordinary forward and backward calls. The
+experimental EP8/MXFP8 dual-context path is the exception: forward may use
+`macrobatch_size=C` to retain every padded routed row, while backward uses a
+separately tuned `macrobatch_size=B<C` with `bwd_schedule="minibatch"`. `C`
+must cover the maximum padded routed-row count across ranks. At `B=C`, select
+the tuned legacy macrobatch path rather than forcing the fine specialization.
+Every EP rank must use the same selected forward configuration and the same
+selected backward configuration.
+
+See [EP8 MXFP8 backward: full-context forward and a fine backward
+ring](docs/bwd-ep8-minibatch-pipeline.md) for the execution contract, memory
+cost, complete per-macrobatch measurements, bandwidth definition, and current
+limitations.
+
+Set these values when constructing `MoKConfig`, and pass the selected
+configuration for that call to the functional layer.
 
 ### Workspace
 

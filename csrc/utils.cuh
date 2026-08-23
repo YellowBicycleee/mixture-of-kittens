@@ -306,11 +306,31 @@ struct globals {
     uint16_t *d_w_routed_down;
     const int *tokens_per_expert;
     const int64_t elements_per_expert;
+    const int macrobatch_size;
+    const bool zero_split_experts;
 };
 
 static __global__ void zero_empty_routed_wgrads_kernel(const __grid_constant__ globals g) {
     const int expert_idx = blockIdx.y;
-    if (g.tokens_per_expert[expert_idx] != 0) return;
+    __shared__ bool zero_this_expert;
+    if (!g.zero_split_experts) {
+        if (g.tokens_per_expert[expert_idx] != 0)
+            return;
+    } else {
+        if (threadIdx.x == 0) {
+            const int expert_rows = g.tokens_per_expert[expert_idx];
+            int expert_begin = 0;
+            for (int i = 0; i < expert_idx; ++i)
+                expert_begin += g.tokens_per_expert[i];
+            const bool split_across_macrobatches = expert_rows > 0 &&
+                expert_begin / g.macrobatch_size !=
+                    (expert_begin + expert_rows - 1) / g.macrobatch_size;
+            zero_this_expert = expert_rows == 0 || split_across_macrobatches;
+        }
+        __syncthreads();
+        if (!zero_this_expert)
+            return;
+    }
     const int64_t expert_offset = expert_idx * g.elements_per_expert;
     for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < g.elements_per_expert; idx += gridDim.x * blockDim.x) {
         g.d_w_routed_gate[expert_offset + idx] = 0;

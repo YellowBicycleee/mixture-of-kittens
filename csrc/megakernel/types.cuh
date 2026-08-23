@@ -9,6 +9,9 @@ struct config {
     static constexpr int MLP_EPI_PIPE_DEPTH = 8;
     static constexpr int MLP_NUM_BF16_D_TILES = 3;
     static constexpr int MLP_NUM_FP8_D_TILES = 4;
+    // EP8 full-context routed-row-prefix toggle.  False keeps O(1)
+    // task/segment decode but retains the legacy Wgrad and Dgrad scans.
+    static constexpr bool EP8_FULL_CONTEXT_WGRAD_EXPERT_ROW_PREFIX = true;
 
     // MXFP8 quantize
     static constexpr int QUANT_Mb = 128;
@@ -234,10 +237,14 @@ struct globals_bwd {
     index_gl schedule_peer_token_idx;                     // (schedule_capacity,)
     index_gl num_tokens;                                  // (1,)
     index_gl tokens_per_expert;                           // (num_local_experts,)
-    index_gl minibatch_expert_offsets;                    // experimental: (capacity minibatches + 1,) compact mini/expert-pair prefix
+    index_gl minibatch_expert_offsets;                    // EP8 minibatch pipeline: (capacity minibatches + 1,) compact mini/expert-pair prefix
+    index_gl completed_segment_offsets;                   // EP8 minibatch pipeline: (capacity minibatches + 1,) completed expert/macro-segment prefix
+    index_gl expert_row_offsets;                          // EP8 full-context: (num_local_experts + 1,) routed-row prefix
+    index_gl completed_segment_experts;                   // EP8 full-context: completed-segment ordinal -> expert
+    index_gl minibatch_task_owner_buckets;                // EP8 full-context: coarse task ordinal -> minibatch owner
 
     // Barrier
-    index_gl router_weights_ready;                        // (num_macrobatches,) router preload -> reverse-combine
+    index_gl router_weights_ready;                        // (num_macrobatches or num_minibatches,) router preload -> reverse-combine
     index_gl d_y_routed_ready;                            // (num_minibatches,) reverse-combine -> dgrad/wgrad down
     index_gl d_hidden_ready;                              // (shared + routed dgrad-down tasks,) dgrad down -> swiglu bwd
     index_gl d_gate_up_ready;                             // (shared + routed row blocks,) swiglu bwd -> dgrad gate/up and wgrad gate/up
@@ -245,14 +252,16 @@ struct globals_bwd {
     index_gl replayed_x_routed_ready;                     // (num_minibatches,) replayed dispatch -> replayed gate/up and wgrad gate/up
     index_gl replayed_gate_up_ready;                      // (routed gate/up tasks,) replayed gate/up -> replayed swiglu
     index_gl replayed_hidden_ready;                       // (routed row blocks,) replayed swiglu -> wgrad down
-    index_gl routed_buffers_done;                         // (num_macrobatches,) current macrobatch -> next macrobatch
-    index_gl wgrad_read_consumed;                         // experimental: (num_minibatches,) Wgrad source reads complete
+    index_gl routed_buffers_done;                         // (num_macrobatches or num_minibatches,) ring generation consumed
+    index_gl wgrad_read_consumed;                         // EP8 minibatch pipeline: (num_minibatches,) Wgrad source reads complete
 
     const int topk;
     const float swiglu_limit;
     const int num_comm_sms;
+    const int context_size;                              // MXFP8 saved routed rows; gradients remain macrobatch-ring sized
     const int macrobatch_size;
     const int minibatch_size;
+    const int minibatch_task_owner_bucket_shift;         // EP8 full-context: log2(owner bucket width)
     const int minibatch_release;
 
     __host__ inline dim3 grid() const {
@@ -272,18 +281,20 @@ struct globals_bwd {
         const int minibatch_bwd_tasks = minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_bwd_tasks + minibatch_row_blocks * hidden_dim_col_blocks;
         const int minibatch_replay_tasks = 2 * minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_fwd_tasks;
         if (minibatch_release) {
-            const int saved_minibatches = min(num_minibatches, macrobatch_size / minibatch_size);
-            // Nonempty expert segments partition the routed rows.  Therefore
-            // the number of (minibatch, expert) intersections is at most one
-            // per minibatch plus one per internal expert boundary.
-            const int max_minibatch_expert_pairs =
-                num_minibatches + max(0, w_routed_gate.depth() - 1);
-            const int minibatch_wgrad_tasks =
-                3 * max_minibatch_expert_pairs * intermediate_dim_col_blocks * hidden_dim_col_blocks;
+            const bool full_context = context_size > macrobatch_size;
+            const int saved_minibatches = full_context
+                ? num_minibatches
+                : min(num_minibatches, macrobatch_size / minibatch_size);
+            // The intersections of the expert and macrobatch partitions are
+            // bounded by their combined number of intervals minus one.
+            const int max_completed_segments =
+                num_macrobatches + max(0, w_routed_gate.depth() - 1);
+            const int segment_wgrad_tasks =
+                3 * max_completed_segments * intermediate_dim_col_blocks * hidden_dim_col_blocks;
             return dim3(config::CLUSTER_SIZE *
                         (shared_tasks + num_minibatches * minibatch_bwd_tasks +
                          (num_minibatches - saved_minibatches) * minibatch_replay_tasks +
-                         minibatch_wgrad_tasks) +
+                         segment_wgrad_tasks) +
                         num_comm_sms);
         }
         const int num_replay_minibatches = (num_macrobatches - 1) * (macrobatch_size / minibatch_size);
