@@ -14,6 +14,7 @@ static_assert(config::CLUSTER_SIZE == 2);
 static_assert(FUSED_GATE_UP_Nb == config::SWIGLU_Nb);
 static_assert(config::MLP_Nb == 2 * config::SWIGLU_Nb);
 static_assert(FUSED_GATE_UP_LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
+static_assert(config::FUSED_GATE_UP_TASK_GROUP_SIZE > 0);
 
 template <bool IS_SHARED, bool IS_CLAMPED>
 static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
@@ -132,7 +133,17 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
         macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::MLP_Mb);
 
-    // Each logical task produces 256 token rows x 128 intermediate columns.
+    // A CLC task owns a short consecutive group of raw 256-row x 128-column
+    // Gate+Up tiles. Keep every raw tile as a complete producer/epilogue
+    // transaction so Down's existing per-row ready count remains unchanged.
+    const int task_group_idx = task_idx;
+    #pragma unroll 1
+    for (int task_group_offset = 0;
+         task_group_offset < config::FUSED_GATE_UP_TASK_GROUP_SIZE;
+         ++task_group_offset) {
+    task_idx = task_group_idx * config::FUSED_GATE_UP_TASK_GROUP_SIZE
+        + task_group_offset;
+
     int3 tile_coord = {-1, -1, -1};
     if constexpr (IS_SHARED) {
         const int row_blocks = a_gmem.rows() / config::MLP_Mb;
@@ -170,6 +181,8 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             global_row_block_offset += expert_row_blocks;
         }
     }
+    // Both CTAs derive the same tail predicate. Returning here is therefore
+    // cluster-uniform, after all earlier raw tiles in this group completed.
     if (tile_coord.z < 0)
         return;
 
@@ -655,5 +668,6 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
         // The leader's TMA wait protects the scratch lifetime.  Collect the
         // whole consumer warpgroup before any thread accepts the next task.
         epilogue_group::sync(1);
+    }
     }
 }

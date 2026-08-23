@@ -4,10 +4,19 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
-    // A fused task computes one MLP_Mb x SWIGLU_Nb hidden tile. CTA 0 supplies
-    // Gate weights and CTA 1 supplies Up weights to the same cooperative MMA.
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::SWIGLU_Nb);
-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::SWIGLU_Nb);
+    // A raw fused task computes one MLP_Mb x SWIGLU_Nb hidden tile. CTA 0
+    // supplies Gate weights and CTA 1 supplies Up weights to the same
+    // cooperative MMA. One CLC task executes a small group of raw tiles
+    // serially to reduce scheduler traffic while retaining per-tile stores and
+    // ready arrivals.
+    const int shared_gate_up_raw_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::SWIGLU_Nb);
+    const int minibatch_routed_gate_up_raw_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::SWIGLU_Nb);
+    const int shared_gate_up_tasks =
+        (shared_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
+        / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
+    const int minibatch_routed_gate_up_tasks =
+        (minibatch_routed_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
+        / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
     const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
     const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
     const int shared_tasks = shared_gate_up_tasks + shared_down_tasks;
@@ -299,6 +308,9 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     const int num_global_row_blocks = schedule_capacity / (config::MLP_Mb / config::CLUSTER_SIZE);
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+    // This legacy forward-only buffer is no longer consumed by the fused
+    // path. Keep its raw-tile extent rather than giving it grouped-task
+    // semantics that would require a separate ceil per minibatch.
     const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::SWIGLU_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::SWIGLU_Nb);
 
@@ -426,6 +438,9 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     const int num_global_row_blocks = schedule_capacity / (config::MLP_Mb / config::CLUSTER_SIZE);
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+    // This legacy forward-only buffer is no longer consumed by the fused
+    // path. Keep its raw-tile extent rather than giving it grouped-task
+    // semantics that would require a separate ceil per minibatch.
     const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::SWIGLU_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::SWIGLU_Nb);
 

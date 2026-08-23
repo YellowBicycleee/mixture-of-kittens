@@ -17,6 +17,8 @@ struct config {
     // Fused SwiGLU + MXFP8 quantize
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
+    static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE =
+        NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1;
     static constexpr int SWIGLU_FWD_PIPE_DEPTH = 3; // gate / up
     static constexpr int SWIGLU_BWD_PIPE_DEPTH = 2; // gate / up / d_hidden
 
@@ -139,8 +141,14 @@ struct globals_fwd {
         const int num_minibatches = (schedule_peer_rank.cols() + minibatch_size - 1) / minibatch_size; // across all macrobatches
         const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
-        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::SWIGLU_Nb);
-        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::SWIGLU_Nb);
+        const int shared_gate_up_raw_tasks = shared_row_blocks * (w_shared_gate.rows() / config::SWIGLU_Nb);
+        const int minibatch_routed_gate_up_raw_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::SWIGLU_Nb);
+        const int shared_gate_up_tasks =
+            (shared_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
+            / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
+        const int minibatch_routed_gate_up_tasks =
+            (minibatch_routed_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
+            / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
         const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
         const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
         const int shared_tasks = shared_gate_up_tasks + shared_down_tasks;
