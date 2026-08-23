@@ -535,6 +535,18 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             epilogue_group::sync(1);
 
             if (save_context) {
+                if constexpr (NUM_DEVICES == 8) {
+                    // EP8 hidden normal uses disjoint q/sc scratch, so issue
+                    // its TMA stores before transposed quantization and
+                    // overlap the copy with that pass.  The final full wait
+                    // still covers every store before publishing Down ready.
+                    if (epilogue_group::laneid() == 0) {
+                        tma::store_async(hidden_gmem, hidden_q_fp8_smem,
+                                         {output_row, tile_coord.y});
+                        tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
+                                         {output_row, tile_coord.y, 0, 0});
+                    }
+                }
                 mxfp8::quantize_tile<
                     false, true, config::SWIGLU_Nb, false, false, false>(
                     hidden_bf16_smem,
@@ -545,10 +557,19 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             }
 
             if (epilogue_group::laneid() == 0) {
-                tma::store_async(hidden_gmem, hidden_q_fp8_smem,
-                                 {output_row, tile_coord.y});
-                tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
-                                 {output_row, tile_coord.y, 0, 0});
+                if constexpr (NUM_DEVICES == 8) {
+                    if (!save_context) {
+                        tma::store_async(hidden_gmem, hidden_q_fp8_smem,
+                                         {output_row, tile_coord.y});
+                        tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
+                                         {output_row, tile_coord.y, 0, 0});
+                    }
+                } else {
+                    tma::store_async(hidden_gmem, hidden_q_fp8_smem,
+                                     {output_row, tile_coord.y});
+                    tma::store_async(*hidden_sc_gmem, hidden_q_sc_smem,
+                                     {output_row, tile_coord.y, 0, 0});
+                }
                 if (save_context) {
                     tma::store_async(*hidden_t_gmem, gate_q_fp8_smem,
                                      {tile_coord.y, output_row});
