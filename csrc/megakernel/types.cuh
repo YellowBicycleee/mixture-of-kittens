@@ -240,8 +240,8 @@ struct globals_bwd {
     index_gl minibatch_expert_offsets;                    // EP8 minibatch pipeline: (capacity minibatches + 1,) compact mini/expert-pair prefix
     index_gl completed_segment_offsets;                   // EP8 minibatch pipeline: (capacity minibatches + 1,) completed expert/macro-segment prefix
     index_gl expert_row_offsets;                          // EP8 full-context: (num_local_experts + 1,) routed-row prefix
-    index_gl completed_segment_experts;                   // EP8 full-context: completed-segment ordinal -> expert
-    index_gl minibatch_task_owner_buckets;                // EP8 full-context: coarse task ordinal -> minibatch owner
+    index_gl completed_segment_experts;                   // EP8 O(1) decode: completed-segment ordinal -> expert
+    index_gl minibatch_task_owner_buckets;                // EP8 O(1) decode: coarse task ordinal -> minibatch owner
 
     // Barrier
     index_gl router_weights_ready;                        // (num_macrobatches or num_minibatches,) router preload -> reverse-combine
@@ -261,7 +261,7 @@ struct globals_bwd {
     const int context_size;                              // MXFP8 saved routed rows; gradients remain macrobatch-ring sized
     const int macrobatch_size;
     const int minibatch_size;
-    const int minibatch_task_owner_bucket_shift;         // EP8 full-context: log2(owner bucket width)
+    const int minibatch_task_owner_bucket_shift;         // EP8 O(1) decode: log2(owner bucket width)
     const int minibatch_release;
 
     __host__ inline dim3 grid() const {

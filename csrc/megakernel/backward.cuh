@@ -17,6 +17,7 @@ struct minibatch_expert_offsets_globals {
     int completed_segment_capacity;
     int minibatch_task_owner_bucket_capacity;
     int minibatch_routed_bwd_tasks;
+    int minibatch_routed_replay_tasks;
     int minibatch_task_owner_bucket_width;
     int segment_wgrad_tasks;
 };
@@ -27,12 +28,13 @@ struct minibatch_expert_offsets_globals {
 //  * completed_segment_offsets counts (macrobatch, active expert) segments by
 //    the global minibatch containing each segment's final row.  Segment Wgrad
 //    is placed immediately after that minibatch's replay/backward work.
-//  * The EP8 full-context specialization also records expert row offsets,
+//  * EP8 O(1)-decode specializations also record expert row offsets,
 //    completed-segment ordinal -> expert, and a coarse routed-task owner table.
 //    Its power-of-two bucket width is at most one minibatch's fixed BWD task
-//    count.  Every minibatch task block is at least that wide, so a bucket
-//    crosses at most one block boundary and the hot decoder needs one shift
-//    and one prefix comparison.
+//    count.  Every minibatch task block is at least that wide, including the
+//    larger Replay blocks in a B-sized ring, so a bucket crosses at most one
+//    block boundary and the hot decoder needs one shift and one prefix
+//    comparison.
 // This is a device function passed to kittens::py::global_kernel because
 // backward.cuh is included inside the dispatch_mlp_swiglu_combiner class
 // template (a raw __global__ member function is not legal CUDA C++).  Capacity
@@ -112,14 +114,23 @@ static __device__ __forceinline__ void build_minibatch_expert_offsets_kernel(
 
     if constexpr (BUILD_EP8_O1_DECODE) {
         if (g.minibatch_routed_bwd_tasks <= 0 ||
+            g.minibatch_routed_replay_tasks < 0 ||
             g.minibatch_task_owner_bucket_width <= 0 ||
             g.segment_wgrad_tasks <= 0 ||
             g.minibatch_task_owner_bucket_capacity <= 0)
             asm volatile("{trap;}");
 
-        const int total_routed_tasks =
-            num_minibatches * g.minibatch_routed_bwd_tasks +
-            completed_segment_count * g.segment_wgrad_tasks;
+        const int saved_context_num_minibatches =
+            min(num_minibatches, g.macrobatch_size / g.minibatch_size);
+        auto routed_task_prefix = [&](int owner) {
+            const int replay_minibatches =
+                max(0, owner - saved_context_num_minibatches);
+            return owner * g.minibatch_routed_bwd_tasks +
+                   replay_minibatches * g.minibatch_routed_replay_tasks +
+                   g.completed_segment_offsets[{owner}] *
+                       g.segment_wgrad_tasks;
+        };
+        const int total_routed_tasks = routed_task_prefix(num_minibatches);
         const int num_owner_buckets =
             total_routed_tasks == 0
                 ? 0
@@ -133,10 +144,7 @@ static __device__ __forceinline__ void build_minibatch_expert_offsets_kernel(
             const int bucket_begin =
                 bucket * g.minibatch_task_owner_bucket_width;
             while (owner + 1 < num_minibatches) {
-                const int next_owner_begin =
-                    (owner + 1) * g.minibatch_routed_bwd_tasks +
-                    g.completed_segment_offsets[{owner + 1}] *
-                        g.segment_wgrad_tasks;
+                const int next_owner_begin = routed_task_prefix(owner + 1);
                 if (next_owner_begin > bucket_begin)
                     break;
                 ++owner;
@@ -208,6 +216,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     // overhead without changing the explicit minibatch API or multi-generation
     // synchronization protocol.
     const bool use_minibatch_pipeline = MINIBATCH_RELEASE && num_macrobatches > 1;
+    // The full-context path and the BF16 EP8 B-sized ring both build the same
+    // coarse owner table.  The latter keeps Replay in its task prefix; this is
+    // only a decoder specialization and does not change the saved context.
+    static constexpr bool use_ep8_o1_decode =
+        MINIBATCH_RELEASE && NUM_DEVICES == 8 && (FULL_CONTEXT || !USE_MXFP8);
     // In the EP8 MXFP8 pipeline, reverse-dispatch is the transitive sink for
     // every non-Wgrad ring reader: dY -> dHidden -> dGate/dUp -> dX and the
     // router partials are all consumed before each comm CTA returns.  Wgrad
@@ -514,7 +527,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     };
     auto decode_minibatch_routed_task = [&](int idx, int &global_minibatch_idx,
                                              int &minibatch_task_idx, bool &replayed) {
-        if constexpr (FULL_CONTEXT) {
+        if constexpr (use_ep8_o1_decode) {
             const int owner_bucket =
                 idx >> g.minibatch_task_owner_bucket_shift;
             int owner = g.minibatch_task_owner_buckets[{owner_bucket}];
@@ -547,7 +560,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     auto completed_segment_wgrad_dense_task = [&](int global_minibatch_idx, int lane_task_idx) {
         const int lane = lane_task_idx / wgrad_tile_tasks;
         const int tile = lane_task_idx % wgrad_tile_tasks;
-        if constexpr (FULL_CONTEXT) {
+        if constexpr (use_ep8_o1_decode) {
             const int segment_ordinal =
                 g.completed_segment_offsets[{global_minibatch_idx}] + lane;
             const int expert_idx =
@@ -1235,6 +1248,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
             .completed_segment_capacity = build_ep8_o1_decode ? max_completed_segments : 0,
             .minibatch_task_owner_bucket_capacity = minibatch_task_owner_bucket_capacity,
             .minibatch_routed_bwd_tasks = build_ep8_o1_decode ? minibatch_routed_bwd_tasks : 0,
+            .minibatch_routed_replay_tasks = 0,
             .minibatch_task_owner_bucket_width = build_ep8_o1_decode ? minibatch_task_owner_bucket_width : 0,
             .segment_wgrad_tasks = build_ep8_o1_decode ? segment_wgrad_tasks : 0,
         };
@@ -1455,6 +1469,65 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
+    const int hidden_dim_col_blocks = hidden_dim / config::MLP_Nb;
+    const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
+    const int minibatch_routed_swiglu_tiles =
+        (minibatch_size / config::SWIGLU_Mb) *
+        (intermediate_dim / config::SWIGLU_Nb);
+    const int minibatch_routed_swiglu_bwd_tasks =
+        (minibatch_routed_swiglu_tiles +
+         config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH - 1) /
+        (config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH);
+    const int minibatch_routed_swiglu_fwd_tasks =
+        (minibatch_routed_swiglu_tiles +
+         config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) /
+        (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+    const int minibatch_routed_bwd_tasks =
+        minibatch_routed_row_blocks * intermediate_dim_col_blocks +
+        minibatch_routed_swiglu_bwd_tasks +
+        minibatch_routed_row_blocks * hidden_dim_col_blocks;
+    const int minibatch_routed_replay_tasks =
+        2 * minibatch_routed_row_blocks * intermediate_dim_col_blocks +
+        minibatch_routed_swiglu_fwd_tasks;
+    const int segment_wgrad_tasks =
+        3 * intermediate_dim_col_blocks * hidden_dim_col_blocks;
+    TORCH_CHECK(minibatch_routed_bwd_tasks > 0,
+                "BF16 minibatch must contain at least one routed BWD task");
+    const int minibatch_task_owner_bucket_shift =
+        31 - __builtin_clz(minibatch_routed_bwd_tasks);
+    const int minibatch_task_owner_bucket_width =
+        1 << minibatch_task_owner_bucket_shift;
+    const bool build_ep8_o1_decode =
+        use_minibatch_release && NUM_DEVICES == 8 && num_macrobatches > 1;
+    const int64_t max_completed_segments_i64 =
+        static_cast<int64_t>(num_macrobatches) +
+        max(0, num_local_experts - 1);
+    const int saved_context_num_minibatches =
+        min(num_global_minibatches, macrobatch_size / minibatch_size);
+    const int max_replay_minibatches =
+        max(0, num_global_minibatches - saved_context_num_minibatches);
+    const int64_t max_routed_tasks_i64 =
+        static_cast<int64_t>(num_global_minibatches) *
+            minibatch_routed_bwd_tasks +
+        static_cast<int64_t>(max_replay_minibatches) *
+            minibatch_routed_replay_tasks +
+        max_completed_segments_i64 * segment_wgrad_tasks;
+    const int64_t owner_buckets_i64 =
+        (max_routed_tasks_i64 + minibatch_task_owner_bucket_width - 1) /
+        minibatch_task_owner_bucket_width;
+    const int64_t minibatch_task_owner_bucket_capacity_i64 =
+        build_ep8_o1_decode ? (owner_buckets_i64 > 0 ? owner_buckets_i64 : 1) : 0;
+    TORCH_CHECK(!build_ep8_o1_decode ||
+                    (max_completed_segments_i64 <= 0x7fffffffLL &&
+                     max_routed_tasks_i64 <= 0x7fffffffLL &&
+                     minibatch_task_owner_bucket_capacity_i64 <= 0x7fffffffLL),
+                "EP8 BF16 Replay-aware task-decode metadata exceeds int32 capacity");
+    const int max_completed_segments =
+        build_ep8_o1_decode
+            ? static_cast<int>(max_completed_segments_i64)
+            : 0;
+    const int minibatch_task_owner_bucket_capacity =
+        static_cast<int>(minibatch_task_owner_bucket_capacity_i64);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl d_y_buffer_data;
@@ -1522,31 +1595,47 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     at::Tensor completed_segment_offsets = use_minibatch_release
         ? at::empty({num_global_minibatches + 1}, tokens_per_expert.options())
         : num_tokens;
+    at::Tensor completed_segment_experts = build_ep8_o1_decode
+        ? at::empty({max(1, max_completed_segments)}, tokens_per_expert.options())
+        : num_tokens;
+    at::Tensor minibatch_task_owner_buckets = build_ep8_o1_decode
+        ? at::empty({minibatch_task_owner_bucket_capacity}, tokens_per_expert.options())
+        : num_tokens;
     if (use_minibatch_release) {
         minibatch_expert_offsets_globals offsets_g {
             .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
             .completed_segment_offsets = kittens::py::tensor_to_gl<index_gl>(completed_segment_offsets),
             .expert_row_offsets = kittens::py::tensor_to_gl<index_gl>(num_tokens),
-            .completed_segment_experts = kittens::py::tensor_to_gl<index_gl>(num_tokens),
-            .minibatch_task_owner_buckets = kittens::py::tensor_to_gl<index_gl>(num_tokens),
+            .completed_segment_experts = kittens::py::tensor_to_gl<index_gl>(completed_segment_experts),
+            .minibatch_task_owner_buckets = kittens::py::tensor_to_gl<index_gl>(minibatch_task_owner_buckets),
             .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
             .tokens_per_expert = kittens::py::tensor_to_gl<index_gl>(tokens_per_expert),
             .num_local_experts = num_local_experts,
             .macrobatch_size = macrobatch_size,
             .minibatch_size = minibatch_size,
             .capacity_minibatches = num_global_minibatches,
-            .completed_segment_capacity = 0,
-            .minibatch_task_owner_bucket_capacity = 0,
-            .minibatch_routed_bwd_tasks = 0,
-            .minibatch_task_owner_bucket_width = 0,
-            .segment_wgrad_tasks = 0,
+            .completed_segment_capacity = build_ep8_o1_decode ? max_completed_segments : 0,
+            .minibatch_task_owner_bucket_capacity = minibatch_task_owner_bucket_capacity,
+            .minibatch_routed_bwd_tasks = build_ep8_o1_decode ? minibatch_routed_bwd_tasks : 0,
+            .minibatch_routed_replay_tasks = build_ep8_o1_decode ? minibatch_routed_replay_tasks : 0,
+            .minibatch_task_owner_bucket_width = build_ep8_o1_decode ? minibatch_task_owner_bucket_width : 0,
+            .segment_wgrad_tasks = build_ep8_o1_decode ? segment_wgrad_tasks : 0,
         };
-        kittens::py::global_kernel<
-            minibatch_expert_offsets_config,
-            minibatch_expert_offsets_globals,
-            build_minibatch_expert_offsets_kernel<false, false>>
-            <<<1, minibatch_expert_offsets_config::NUM_THREADS, 0,
-               at::cuda::getCurrentCUDAStream()>>>(offsets_g);
+        if (build_ep8_o1_decode) {
+            kittens::py::global_kernel<
+                minibatch_expert_offsets_config,
+                minibatch_expert_offsets_globals,
+                build_minibatch_expert_offsets_kernel<true, false>>
+                <<<1, minibatch_expert_offsets_config::NUM_THREADS, 0,
+                   at::cuda::getCurrentCUDAStream()>>>(offsets_g);
+        } else {
+            kittens::py::global_kernel<
+                minibatch_expert_offsets_config,
+                minibatch_expert_offsets_globals,
+                build_minibatch_expert_offsets_kernel<false, false>>
+                <<<1, minibatch_expert_offsets_config::NUM_THREADS, 0,
+                   at::cuda::getCurrentCUDAStream()>>>(offsets_g);
+        }
     }
 
     globals_bwd g {
@@ -1620,8 +1709,8 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .minibatch_expert_offsets = kittens::py::tensor_to_gl<index_gl>(minibatch_expert_offsets),
         .completed_segment_offsets = kittens::py::tensor_to_gl<index_gl>(completed_segment_offsets),
         .expert_row_offsets = kittens::py::tensor_to_gl<index_gl>(num_tokens),
-        .completed_segment_experts = kittens::py::tensor_to_gl<index_gl>(num_tokens),
-        .minibatch_task_owner_buckets = kittens::py::tensor_to_gl<index_gl>(num_tokens),
+        .completed_segment_experts = kittens::py::tensor_to_gl<index_gl>(completed_segment_experts),
+        .minibatch_task_owner_buckets = kittens::py::tensor_to_gl<index_gl>(minibatch_task_owner_buckets),
         .router_weights_ready = kittens::py::tensor_to_gl<index_gl>(router_weights_ready),
         .d_y_routed_ready = kittens::py::tensor_to_gl<index_gl>(d_y_routed_ready),
         .d_hidden_ready = kittens::py::tensor_to_gl<index_gl>(d_hidden_ready),
@@ -1639,7 +1728,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .context_size = macrobatch_size,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size,
-        .minibatch_task_owner_bucket_shift = 0,
+        .minibatch_task_owner_bucket_shift = build_ep8_o1_decode ? minibatch_task_owner_bucket_shift : 0,
         .minibatch_release = use_minibatch_release ? 1 : 0
     };
 

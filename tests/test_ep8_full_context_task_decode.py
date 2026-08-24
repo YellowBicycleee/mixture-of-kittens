@@ -1,4 +1,4 @@
-"""CPU reference tests for the EP8 full-context Dgrad task decoder."""
+"""CPU references for EP8 expert and routed-task decoders."""
 
 from __future__ import annotations
 
@@ -137,6 +137,14 @@ def _task_widths(
     return minibatch_bwd_tasks, segment_wgrad_tasks
 
 
+def _replay_task_width(minibatch: int, intermediate: int) -> int:
+    row_blocks = minibatch // MLP_MB
+    intermediate_blocks = intermediate // MLP_MB
+    swiglu_tiles = (minibatch // 128) * (intermediate // 128)
+    swiglu_tasks = (swiglu_tiles + 6 - 1) // 6
+    return 2 * row_blocks * intermediate_blocks + swiglu_tasks
+
+
 def _completed_segment_offsets(
     tokens_per_expert: list[int], macrobatch: int, minibatch: int
 ) -> list[int]:
@@ -164,13 +172,40 @@ def _completed_segment_offsets(
     return offsets
 
 
+def _completed_segment_experts_by_owner(
+    tokens_per_expert: list[int], macrobatch: int, minibatch: int
+) -> list[list[int]]:
+    routed_rows = sum(tokens_per_expert)
+    num_minibatches = (routed_rows + minibatch - 1) // minibatch
+    experts_by_owner: list[list[int]] = [[] for _ in range(num_minibatches)]
+    expert_begin = 0
+    for expert, expert_rows in enumerate(tokens_per_expert):
+        expert_end = expert_begin + expert_rows
+        first_macrobatch = expert_begin // macrobatch
+        last_macrobatch = (expert_end - 1) // macrobatch if expert_rows else -1
+        for macrobatch_idx in range(first_macrobatch, last_macrobatch + 1):
+            segment_begin = max(expert_begin, macrobatch_idx * macrobatch)
+            segment_end = min(expert_end, (macrobatch_idx + 1) * macrobatch)
+            if segment_begin < segment_end:
+                owner = (segment_end - 1) // minibatch
+                experts_by_owner[owner].append(expert)
+        expert_begin = expert_end
+    return experts_by_owner
+
+
 def _task_prefixes(
     completed_segment_offsets: list[int],
     minibatch_bwd_tasks: int,
     segment_wgrad_tasks: int,
+    saved_context_minibatches: int | None = None,
+    minibatch_replay_tasks: int = 0,
 ) -> list[int]:
+    num_minibatches = len(completed_segment_offsets) - 1
+    if saved_context_minibatches is None:
+        saved_context_minibatches = num_minibatches
     return [
         owner * minibatch_bwd_tasks
+        + max(0, owner - saved_context_minibatches) * minibatch_replay_tasks
         + completed * segment_wgrad_tasks
         for owner, completed in enumerate(completed_segment_offsets)
     ]
@@ -221,6 +256,7 @@ def _assert_task_owner_case(
     minibatch: int,
     hidden: int,
     intermediate: int,
+    replay: bool = False,
 ) -> list[int]:
     completed = _completed_segment_offsets(
         tokens_per_expert, macrobatch, minibatch
@@ -228,15 +264,37 @@ def _assert_task_owner_case(
     minibatch_tasks, segment_tasks = _task_widths(
         minibatch, hidden, intermediate
     )
-    prefixes = _task_prefixes(completed, minibatch_tasks, segment_tasks)
+    saved_context_minibatches = macrobatch // minibatch
+    replay_tasks = _replay_task_width(minibatch, intermediate) if replay else 0
+    prefixes = _task_prefixes(
+        completed,
+        minibatch_tasks,
+        segment_tasks,
+        saved_context_minibatches,
+        replay_tasks,
+    )
     bucket_shift = minibatch_tasks.bit_length() - 1
     bucket_width = 1 << bucket_shift
     buckets = _build_task_owner_buckets(prefixes, bucket_width)
     assert bucket_width <= minibatch_tasks
+    assert all(
+        prefixes[owner + 1] - prefixes[owner] >= bucket_width
+        for owner in range(len(prefixes) - 1)
+    )
     for idx in range(prefixes[-1]):
         decoded = _bucket_decode(prefixes, buckets, bucket_shift, idx)
         assert decoded == _linear_task_owner(prefixes, idx)
         assert decoded == _binary_task_owner(prefixes, idx)
+    experts_by_owner = _completed_segment_experts_by_owner(
+        tokens_per_expert, macrobatch, minibatch
+    )
+    completed_experts = [
+        expert for owner_experts in experts_by_owner for expert in owner_experts
+    ]
+    for owner, owner_experts in enumerate(experts_by_owner):
+        begin = completed[owner]
+        end = completed[owner + 1]
+        assert completed_experts[begin:end] == owner_experts
     return completed
 
 
@@ -305,3 +363,94 @@ def test_seeded_task_owner_buckets_match_both_references() -> None:
             rng.choice([1024, 2048, 4096]),
             rng.choice([512, 1024, 2048]),
         )
+
+
+def test_replay_aware_owner_buckets_cover_threshold_empty_split_and_tail() -> None:
+    cases = [
+        ([0, 512, 0, 768, 256], 512, 256, 1024, 512),
+        ([768, 0, 256, 512], 512, 256, 2048, 1024),
+        ([0, 768, 256, 0, 768], 1024, 512, 4096, 1024),
+    ]
+    for tokens, macrobatch, minibatch, hidden, intermediate in cases:
+        completed = _assert_task_owner_case(
+            tokens,
+            macrobatch,
+            minibatch,
+            hidden,
+            intermediate,
+            replay=True,
+        )
+        bwd_tasks, segment_tasks = _task_widths(
+            minibatch, hidden, intermediate
+        )
+        replay_tasks = _replay_task_width(minibatch, intermediate)
+        saved = macrobatch // minibatch
+        prefixes = _task_prefixes(
+            completed, bwd_tasks, segment_tasks, saved, replay_tasks
+        )
+        if len(prefixes) - 1 > saved:
+            assert prefixes[saved + 1] - prefixes[saved] >= (
+                bwd_tasks + replay_tasks
+            )
+            assert _binary_task_owner(prefixes, prefixes[saved]) == (saved, 0)
+
+
+def test_seeded_replay_aware_owner_buckets_match_both_references() -> None:
+    rng = random.Random(20260824 ^ 0xB300)
+    for _ in range(40):
+        minibatch = rng.choice([256, 512, 1024])
+        macrobatch = minibatch * rng.choice([1, 2, 4, 8])
+        experts = rng.choice([1, 4, 16, 64])
+        tokens = _random_partition(rng, rng.randint(1, 96), experts)
+        _assert_task_owner_case(
+            tokens,
+            macrobatch,
+            minibatch,
+            rng.choice([1024, 2048, 4096]),
+            rng.choice([512, 1024, 2048]),
+            replay=True,
+        )
+
+
+def test_qwen_100k_b131072_replay_task_count_and_bucket_capacity() -> None:
+    # 64 EP8-local expert spans use the three padded sizes observed in the
+    # Qwen-shaped 100K benchmark.  This ordering avoids coincident expert and
+    # macrobatch boundaries, giving the worst-case E + M - 1 segments.
+    expert_blocks = [64] * 32 + [63] * 16 + [62] * 16
+    random.Random(0).shuffle(expert_blocks)
+    tokens = [blocks * MLP_MB for blocks in expert_blocks]
+    macrobatch = 131072
+    minibatch = 4096
+    completed = _completed_segment_offsets(tokens, macrobatch, minibatch)
+    bwd_tasks, segment_tasks = _task_widths(minibatch, 4096, 1024)
+    replay_tasks = _replay_task_width(minibatch, 1024)
+    saved = macrobatch // minibatch
+    prefixes = _task_prefixes(
+        completed, bwd_tasks, segment_tasks, saved, replay_tasks
+    )
+    bucket_shift = bwd_tasks.bit_length() - 1
+    buckets = _build_task_owner_buckets(prefixes, 1 << bucket_shift)
+
+    assert sum(tokens) == 1036288
+    assert len(completed) - 1 == 253
+    assert saved == 32
+    assert bwd_tasks == 384
+    assert replay_tasks == 171
+    assert segment_tasks == 192
+    assert completed[-1] == 71
+    assert prefixes[-1] == 148575
+    assert len(buckets) == 581
+
+    boundary_indices = {
+        index
+        for prefix in prefixes
+        for index in (prefix - 1, prefix, prefix + 1)
+        if 0 <= index < prefixes[-1]
+    }
+    rng = random.Random(20260824)
+    sampled_indices = boundary_indices | {
+        rng.randrange(prefixes[-1]) for _ in range(10000)
+    }
+    for idx in sampled_indices:
+        decoded = _bucket_decode(prefixes, buckets, bucket_shift, idx)
+        assert decoded == _binary_task_owner(prefixes, idx)
