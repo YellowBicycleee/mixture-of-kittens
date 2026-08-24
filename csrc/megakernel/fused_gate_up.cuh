@@ -57,7 +57,8 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     const uint64_t smem_base_addr
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
-    static constexpr bool PURE_BF16 = !USE_MXFP8;
+    static constexpr bool OVERLAP_EP8_BF16_CONTEXT_STORES =
+        NUM_DEVICES == 8 && !USE_MXFP8;
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     using b_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     constexpr int MLP_Kb = USE_ROUTED_MXFP8 ? config::MLP_FP8_Kb : config::MLP_BF16_Kb;
@@ -77,14 +78,16 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     // Scratch is disjoint from the four-stage input ring.  Routed MXFP8 keeps
     // one BF16 hidden tile plus independent Gate, Up, and hidden-normal q
     // buffers; shared/routed-BF16 retain the V2.1 Gate/Up raw layout.
-    // A pure-BF16 instantiation never touches the scale ring. Reclaim it for
+    // The EP8 BF16 instantiation never touches the scale ring. Reclaim it for
     // a disjoint Hidden tile so the Gate/Up context stores can read their raw
     // tiles while the consumer warpgroup executes SwiGLU. Keep the scale-ring
     // layout intact for an MXFP8 instantiation: its shared-BF16 task can overlap
     // a following routed-MXFP8 producer that already writes these scale stages.
     static constexpr uint64_t FUSED_GATE_UP_RING_BYTES =
         sizeof(a_smem) + sizeof(b_smem)
-        + (PURE_BF16 ? 0 : sizeof(a_sc_smem) + sizeof(b_sc_smem));
+        + (OVERLAP_EP8_BF16_CONTEXT_STORES
+               ? 0
+               : sizeof(a_sc_smem) + sizeof(b_sc_smem));
     static_assert(FUSED_GATE_UP_RING_BYTES % 1024 == 0);
     const uint64_t scratch_base_addr =
         smem_base_addr + FUSED_GATE_UP_RING_BYTES;
@@ -105,7 +108,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     static constexpr uint64_t ROUTED_SCRATCH_BYTES =
         ROUTED_HIDDEN_Q_SC_OFFSET + sizeof(quant_sc_tile);
     static constexpr uint64_t BF16_SCRATCH_BYTES =
-        PURE_BF16
+        OVERLAP_EP8_BF16_CONTEXT_STORES
             ? 3 * sizeof(quant_bf16_tile)
             : 2 * sizeof(quant_bf16_tile)
                 + sizeof(quant_fp8_tile) + sizeof(quant_sc_tile);
@@ -608,8 +611,8 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                         + macrobatch_row_block_offset + tile_coord.x);
             }
         } else {
-            // Shared/routed-BF16 path: materialize Gate and Up. A pure-BF16
-            // instantiation writes SwiGLU to a disjoint Hidden tile, allowing
+            // Shared/routed-BF16 path: materialize Gate and Up. EP8 BF16 writes
+            // SwiGLU to a disjoint Hidden tile, allowing
             // the context TMA stores to read Gate/Up concurrently. The shared
             // BF16 task inside an MXFP8 instantiation retains the old in-place
             // layout because its next routed task can already use the scale ring.
@@ -666,7 +669,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                                      {output_row, tile_coord.y});
                     tma::store_async(up_context_gmem, up_raw_smem,
                                      {output_row, tile_coord.y});
-                    if constexpr (!PURE_BF16)
+                    if constexpr (!OVERLAP_EP8_BF16_CONTEXT_STORES)
                         tma::store_async_read_wait();
                 }
                 epilogue_group::sync(1);
@@ -677,7 +680,9 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             const auto *up_pairs =
                 reinterpret_cast<const bf16_2 *>(up_raw_smem.data);
             auto *hidden_pairs = reinterpret_cast<bf16_2 *>(
-                PURE_BF16 ? hidden_raw_smem.data : gate_raw_smem.data);
+                OVERLAP_EP8_BF16_CONTEXT_STORES
+                    ? hidden_raw_smem.data
+                    : gate_raw_smem.data);
             constexpr int NUM_PAIRS = config::SWIGLU_Mb * config::SWIGLU_Nb / 2;
             constexpr int EPILOGUE_THREADS = WARPGROUP_WARPS * WARP_THREADS;
             #pragma unroll 1
@@ -707,7 +712,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             epilogue_group::sync(1);
 
             if (epilogue_group::laneid() == 0) {
-                if constexpr (PURE_BF16)
+                if constexpr (OVERLAP_EP8_BF16_CONTEXT_STORES)
                     tma::store_async(hidden_gmem, hidden_raw_smem,
                                      {output_row, tile_coord.y});
                 else
