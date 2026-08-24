@@ -17,7 +17,11 @@ struct config {
     // Fused SwiGLU + MXFP8 quantize
     static constexpr int SWIGLU_Mb = 128;
     static constexpr int SWIGLU_Nb = 128;
+    // A CLC task serially executes this many complete raw output tiles.  This
+    // tunes scheduler/launch granularity without changing either GEMM tile.
     static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE = 1;
+    static constexpr int FUSED_DOWN_TASK_GROUP_SIZE =
+        NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1;
     static constexpr int SWIGLU_FWD_PIPE_DEPTH = 3; // gate / up
     static constexpr int SWIGLU_BWD_PIPE_DEPTH = 2; // gate / up / d_hidden
 
@@ -41,6 +45,9 @@ struct config {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 };
+
+static_assert(config::FUSED_GATE_UP_TASK_GROUP_SIZE > 0);
+static_assert(config::FUSED_DOWN_TASK_GROUP_SIZE > 0);
 
 // Grouped GEMM tiles
 using mlp_fp8_tile = st_fp8e4m3<config::MLP_Mb / 2, config::MLP_FP8_Kb>;
@@ -148,8 +155,14 @@ struct globals_fwd {
         const int minibatch_routed_gate_up_tasks =
             (minibatch_routed_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
             / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
-        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
-        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
+        const int shared_down_raw_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
+        const int minibatch_routed_down_raw_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
+        const int shared_down_tasks =
+            (shared_down_raw_tasks + config::FUSED_DOWN_TASK_GROUP_SIZE - 1)
+            / config::FUSED_DOWN_TASK_GROUP_SIZE;
+        const int minibatch_routed_down_tasks =
+            (minibatch_routed_down_raw_tasks + config::FUSED_DOWN_TASK_GROUP_SIZE - 1)
+            / config::FUSED_DOWN_TASK_GROUP_SIZE;
         const int shared_tasks = shared_gate_up_tasks + shared_down_tasks;
         const int minibatch_tasks = minibatch_routed_gate_up_tasks + minibatch_routed_down_tasks;
         return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + num_comm_sms);

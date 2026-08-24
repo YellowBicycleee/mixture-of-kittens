@@ -17,8 +17,14 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     const int minibatch_routed_gate_up_tasks =
         (minibatch_routed_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
         / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
-    const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
-    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
+    const int shared_down_raw_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
+    const int minibatch_routed_down_raw_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
+    const int shared_down_tasks =
+        (shared_down_raw_tasks + config::FUSED_DOWN_TASK_GROUP_SIZE - 1)
+        / config::FUSED_DOWN_TASK_GROUP_SIZE;
+    const int minibatch_routed_down_tasks =
+        (minibatch_routed_down_raw_tasks + config::FUSED_DOWN_TASK_GROUP_SIZE - 1)
+        / config::FUSED_DOWN_TASK_GROUP_SIZE;
     const int shared_tasks = shared_gate_up_tasks + shared_down_tasks;
     const int minibatch_tasks = minibatch_routed_gate_up_tasks + minibatch_routed_down_tasks;
     const int comm_clusters = g.num_comm_sms / config::CLUSTER_SIZE;
@@ -171,14 +177,22 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                 0, 0, task_idx, cta_rank, 0, smem_base_addr);
         } else if (compute_cluster_idx < shared_tasks) {
             // Shared down (BF16)
-            const int task_idx = compute_cluster_idx - shared_gate_up_tasks;
-            expert_grouped_gemm_kernel<true, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_shared, g.w_shared_down, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                      g.y_shared, nullptr, nullptr,
-                                      g.tokens_per_expert, nullptr, &g.hidden_row_block_ready, nullptr, nullptr, nullptr, nullptr,
-                                      d_tt, a_sc_tt, b_sc_tt,
-                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                      num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+            const int task_group_idx = compute_cluster_idx - shared_gate_up_tasks;
+            #pragma unroll 1
+            for (int task_group_offset = 0;
+                 task_group_offset < config::FUSED_DOWN_TASK_GROUP_SIZE;
+                 ++task_group_offset) {
+                const int task_idx =
+                    task_group_idx * config::FUSED_DOWN_TASK_GROUP_SIZE
+                    + task_group_offset;
+                expert_grouped_gemm_kernel<true, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_shared, g.w_shared_down, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                          g.y_shared, nullptr, nullptr,
+                                          g.tokens_per_expert, nullptr, &g.hidden_row_block_ready, nullptr, nullptr, nullptr, nullptr,
+                                          d_tt, a_sc_tt, b_sc_tt,
+                                          gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                          num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
+                                          0, 0, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+            }
         } else {
             // Routed expert with macro/minibatching
             const int task_ordered_global_minibatch_idx = (compute_cluster_idx - shared_tasks) / minibatch_tasks;
@@ -216,16 +230,25 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                     shared_row_blocks, smem_base_addr);
             } else {
                 // Routed down
-                const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
-                expert_grouped_gemm_kernel<false, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_fp8_routed, g.w_routed_down, &g.hidden_sc_routed, &g.w_routed_down_sc, nullptr, nullptr, nullptr, nullptr,
-                                           g.y_routed, nullptr, nullptr,
-                                           g.tokens_per_expert, nullptr, &g.hidden_row_block_ready,
-                                           macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_done : nullptr,
-                                           nullptr, &g.y_routed_ready, nullptr,
-                                           d_tt, a_sc_tt, b_sc_tt,
-                                           gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                           0, shared_row_blocks, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+                const int task_group_idx =
+                    minibatch_task_idx - minibatch_routed_gate_up_tasks;
+                #pragma unroll 1
+                for (int task_group_offset = 0;
+                     task_group_offset < config::FUSED_DOWN_TASK_GROUP_SIZE;
+                     ++task_group_offset) {
+                    const int task_idx =
+                        task_group_idx * config::FUSED_DOWN_TASK_GROUP_SIZE
+                        + task_group_offset;
+                    expert_grouped_gemm_kernel<false, false, false, FUSED_GATE_UP_LOAD_PIPE_DEPTH>(g.hidden_fp8_routed, g.w_routed_down, &g.hidden_sc_routed, &g.w_routed_down_sc, nullptr, nullptr, nullptr, nullptr,
+                                               g.y_routed, nullptr, nullptr,
+                                               g.tokens_per_expert, nullptr, &g.hidden_row_block_ready,
+                                               macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_done : nullptr,
+                                               nullptr, &g.y_routed_ready, nullptr,
+                                               d_tt, a_sc_tt, b_sc_tt,
+                                               gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                               0, shared_row_blocks, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+                }
             }
         }
 
