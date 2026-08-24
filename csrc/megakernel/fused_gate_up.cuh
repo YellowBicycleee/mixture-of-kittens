@@ -57,6 +57,7 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     const uint64_t smem_base_addr
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
+    static constexpr bool PURE_BF16 = !USE_MXFP8;
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     using b_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile, mlp_bf16_tile>;
     constexpr int MLP_Kb = USE_ROUTED_MXFP8 ? config::MLP_FP8_Kb : config::MLP_BF16_Kb;
@@ -76,9 +77,14 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     // Scratch is disjoint from the four-stage input ring.  Routed MXFP8 keeps
     // one BF16 hidden tile plus independent Gate, Up, and hidden-normal q
     // buffers; shared/routed-BF16 retain the V2.1 Gate/Up raw layout.
+    // A pure-BF16 instantiation never touches the scale ring. Reclaim it for
+    // a disjoint Hidden tile so the Gate/Up context stores can read their raw
+    // tiles while the consumer warpgroup executes SwiGLU. Keep the scale-ring
+    // layout intact for an MXFP8 instantiation: its shared-BF16 task can overlap
+    // a following routed-MXFP8 producer that already writes these scale stages.
     static constexpr uint64_t FUSED_GATE_UP_RING_BYTES =
         sizeof(a_smem) + sizeof(b_smem)
-        + sizeof(a_sc_smem) + sizeof(b_sc_smem);
+        + (PURE_BF16 ? 0 : sizeof(a_sc_smem) + sizeof(b_sc_smem));
     static_assert(FUSED_GATE_UP_RING_BYTES % 1024 == 0);
     const uint64_t scratch_base_addr =
         smem_base_addr + FUSED_GATE_UP_RING_BYTES;
@@ -99,14 +105,18 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
     static constexpr uint64_t ROUTED_SCRATCH_BYTES =
         ROUTED_HIDDEN_Q_SC_OFFSET + sizeof(quant_sc_tile);
     static constexpr uint64_t BF16_SCRATCH_BYTES =
-        2 * sizeof(quant_bf16_tile)
-        + sizeof(quant_fp8_tile) + sizeof(quant_sc_tile);
+        PURE_BF16
+            ? 3 * sizeof(quant_bf16_tile)
+            : 2 * sizeof(quant_bf16_tile)
+                + sizeof(quant_fp8_tile) + sizeof(quant_sc_tile);
     static constexpr uint64_t ACTIVE_SCRATCH_BYTES =
         USE_ROUTED_MXFP8 ? ROUTED_SCRATCH_BYTES : BF16_SCRATCH_BYTES;
 
     auto &gate_raw_smem = *reinterpret_cast<quant_bf16_tile *>(scratch_base_addr);
     auto &up_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
         scratch_base_addr + sizeof(gate_raw_smem));
+    auto &hidden_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
+        scratch_base_addr + 2 * sizeof(quant_bf16_tile));
     auto &hidden_bf16_smem = *reinterpret_cast<quant_bf16_tile *>(
         scratch_base_addr + ROUTED_HIDDEN_BF16_OFFSET);
     auto &gate_q_fp8_smem = *reinterpret_cast<quant_fp8_tile *>(
@@ -598,8 +608,11 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                         + macrobatch_row_block_offset + tile_coord.x);
             }
         } else {
-            // V2.1 shared/routed-BF16 path: materialize Gate and Up, save the
-            // required context, then overwrite Gate with hidden.
+            // Shared/routed-BF16 path: materialize Gate and Up. A pure-BF16
+            // instantiation writes SwiGLU to a disjoint Hidden tile, allowing
+            // the context TMA stores to read Gate/Up concurrently. The shared
+            // BF16 task inside an MXFP8 instantiation retains the old in-place
+            // layout because its next routed task can already use the scale ring.
             #pragma unroll 1
             for (int block = 0; block < config::MLP_Nb / 32; ++block) {
                 float2 tmp[16];
@@ -653,7 +666,8 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                                      {output_row, tile_coord.y});
                     tma::store_async(up_context_gmem, up_raw_smem,
                                      {output_row, tile_coord.y});
-                    tma::store_async_read_wait();
+                    if constexpr (!PURE_BF16)
+                        tma::store_async_read_wait();
                 }
                 epilogue_group::sync(1);
             }
@@ -662,7 +676,8 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
                 reinterpret_cast<const bf16_2 *>(gate_raw_smem.data);
             const auto *up_pairs =
                 reinterpret_cast<const bf16_2 *>(up_raw_smem.data);
-            auto *hidden_pairs = reinterpret_cast<bf16_2 *>(gate_raw_smem.data);
+            auto *hidden_pairs = reinterpret_cast<bf16_2 *>(
+                PURE_BF16 ? hidden_raw_smem.data : gate_raw_smem.data);
             constexpr int NUM_PAIRS = config::SWIGLU_Mb * config::SWIGLU_Nb / 2;
             constexpr int EPILOGUE_THREADS = WARPGROUP_WARPS * WARP_THREADS;
             #pragma unroll 1
@@ -692,8 +707,12 @@ static __device__ __forceinline__ void expert_gate_up_swiglu_ep8_tuned_kernel(
             epilogue_group::sync(1);
 
             if (epilogue_group::laneid() == 0) {
-                tma::store_async(hidden_gmem, gate_raw_smem,
-                                 {output_row, tile_coord.y});
+                if constexpr (PURE_BF16)
+                    tma::store_async(hidden_gmem, hidden_raw_smem,
+                                     {output_row, tile_coord.y});
+                else
+                    tma::store_async(hidden_gmem, gate_raw_smem,
+                                     {output_row, tile_coord.y});
                 tma::store_async_wait();
                 barrier_arrive(
                     hidden_row_block_ready,
