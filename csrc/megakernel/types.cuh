@@ -250,7 +250,7 @@ struct globals_bwd {
     index_gl d_gate_up_ready;                             // (shared + routed row blocks,) swiglu bwd -> dgrad gate/up and wgrad gate/up
     index_gl d_x_routed_ready;                            // (num_minibatches,) dgrad gate/up -> reverse-dispatch
     index_gl replayed_x_routed_ready;                     // (num_minibatches,) replayed dispatch -> replayed gate/up and wgrad gate/up
-    index_gl replayed_gate_up_ready;                      // (routed gate/up tasks,) replayed gate/up -> replayed swiglu
+    index_gl replayed_gate_up_ready;                      // (routed Gate/Up tiles,) separate tasks or paired task(+2/CTA) -> replayed SwiGLU
     index_gl replayed_hidden_ready;                       // (routed row blocks,) replayed swiglu -> wgrad down
     index_gl routed_buffers_done;                         // (num_macrobatches or num_minibatches,) ring generation consumed
     index_gl wgrad_read_consumed;                         // EP8 minibatch pipeline: (num_minibatches,) Wgrad source reads complete
@@ -279,7 +279,13 @@ struct globals_bwd {
         const int minibatch_swiglu_fwd_tasks = (minibatch_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
         const int shared_tasks = shared_row_blocks * intermediate_dim_col_blocks + shared_swiglu_bwd_tasks + shared_row_blocks * hidden_dim_col_blocks + 3 * intermediate_dim_col_blocks * hidden_dim_col_blocks;
         const int minibatch_bwd_tasks = minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_bwd_tasks + minibatch_row_blocks * hidden_dim_col_blocks;
-        const int minibatch_replay_tasks = 2 * minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_fwd_tasks;
+        const bool use_bf16_replay_paired_gate_up =
+            minibatch_release && NUM_DEVICES == 8 && !USE_MXFP8 &&
+            context_size == macrobatch_size;
+        const int minibatch_replay_tasks =
+            (use_bf16_replay_paired_gate_up ? 1 : 2) *
+                minibatch_row_blocks * intermediate_dim_col_blocks +
+            minibatch_swiglu_fwd_tasks;
         if (minibatch_release) {
             const bool full_context = context_size > macrobatch_size;
             const int saved_minibatches = full_context

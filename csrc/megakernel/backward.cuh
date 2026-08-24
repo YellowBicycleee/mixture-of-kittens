@@ -31,10 +31,9 @@ struct minibatch_expert_offsets_globals {
 //  * EP8 O(1)-decode specializations also record expert row offsets,
 //    completed-segment ordinal -> expert, and a coarse routed-task owner table.
 //    Its power-of-two bucket width is at most one minibatch's fixed BWD task
-//    count.  Every minibatch task block is at least that wide, including the
-//    larger Replay blocks in a B-sized ring, so a bucket crosses at most one
-//    block boundary and the hot decoder needs one shift and one prefix
-//    comparison.
+//    count.  Every owner span includes that fixed BWD block; Replay and Wgrad
+//    only add work, so a bucket crosses at most one owner boundary and the hot
+//    decoder needs one shift and one prefix comparison.
 // This is a device function passed to kittens::py::global_kernel because
 // backward.cuh is included inside the dispatch_mlp_swiglu_combiner class
 // template (a raw __global__ member function is not legal CUDA C++).  Capacity
@@ -194,7 +193,16 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
     const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * intermediate_dim_col_blocks;
     const int minibatch_routed_swiglu_fwd_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
-    const int minibatch_routed_replay_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_fwd_tasks;
+    // Only BF16 EP8 B-sized minibatch Replay pairs Gate+Up.  Saved first-gen,
+    // macro scheduling, MXFP8, and FULL_CONTEXT retain their original layout.
+    static constexpr bool use_bf16_replay_paired_gate_up =
+        MINIBATCH_RELEASE && NUM_DEVICES == 8 && !USE_MXFP8 && !FULL_CONTEXT;
+    const int minibatch_routed_replay_gate_up_tasks =
+        (use_bf16_replay_paired_gate_up ? 1 : 2) *
+        minibatch_routed_gate_up_tasks;
+    const int minibatch_routed_replay_tasks =
+        minibatch_routed_replay_gate_up_tasks +
+        minibatch_routed_swiglu_fwd_tasks;
 
     const int comm_clusters = g.num_comm_sms / config::CLUSTER_SIZE;
     const int macrobatch_size = g.macrobatch_size;
@@ -343,7 +351,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     }
 
     tensor_allocator<1, config::CLUSTER_SIZE> tm_alloc{};
+    static_assert(2 * config::MLP_Nb <= decltype(tm_alloc)::cols,
+                  "paired BF16 Replay requires two MLP accumulator halves");
     tt<float, config::MLP_Mb / 2, config::MLP_Nb> d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(0);
+    // BF16 does not consume the MXFP8 scale region.  Its paired Replay task
+    // uses that exact TMEM half for the independent Up accumulator.
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> paired_d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(256);
     full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH> a_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH>>(256);
     full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH> b_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH>>(384);
     everyone::tma::cluster::sync();
@@ -607,7 +620,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
             if constexpr (!FULL_CONTEXT) {
                 if (replayed) {
                     if (minibatch_task_idx < minibatch_routed_replay_tasks)
-                        return minibatch_task_idx >= 2 * minibatch_routed_gate_up_tasks;
+                        return minibatch_task_idx >=
+                               minibatch_routed_replay_gate_up_tasks;
                     minibatch_task_idx -= minibatch_routed_replay_tasks;
                 }
             }
@@ -630,7 +644,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 macrobatch_num_minibatches = num_minibatches_of(macrobatch_idx);
                 macrobatch_task_idx = idx % replayed_macrobatch_tasks;
                 if (macrobatch_task_idx < macrobatch_num_minibatches * minibatch_routed_replay_tasks)
-                    return macrobatch_task_idx % minibatch_routed_replay_tasks >= 2 * minibatch_routed_gate_up_tasks; // swiglu fwd replay
+                    return macrobatch_task_idx % minibatch_routed_replay_tasks >=
+                           minibatch_routed_replay_gate_up_tasks; // swiglu fwd replay
                 macrobatch_task_idx -= macrobatch_num_minibatches * minibatch_routed_replay_tasks;
             }
         }
@@ -769,7 +784,34 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                     if (!use_minibatch_pipeline)
                         minibatch_idx = macrobatch_task_idx / minibatch_routed_replay_tasks;
                     const int minibatch_task_idx = macrobatch_task_idx % minibatch_routed_replay_tasks;
-                    if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
+                    if constexpr (use_bf16_replay_paired_gate_up) {
+                        if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
+                            // One M256N256 task refreshes Gate+Up and loads x once.
+                            const int task_idx = minibatch_task_idx;
+                            expert_grouped_gate_up_replay_kernel<true>(
+                                g.x_fp8_routed, g.w_routed_gate, g.w_routed_up,
+                                g.gate_routed, g.up_routed,
+                                g.tokens_per_expert, g.replayed_x_routed_ready,
+                                g.replayed_gate_up_ready, d_tt, paired_d_tt,
+                                gemm_inputs_arrived, gemm_inputs_finished,
+                                gemm_outputs_arrived, gemm_outputs_finished,
+                                gemm_bitfield, num_tokens, macrobatch_size,
+                                g.minibatch_size, macrobatch_idx, minibatch_idx,
+                                task_idx, cta_rank, smem_base_addr);
+                        } else {
+                            // Replay Swiglu refreshes the routed hidden activation.
+                            const int task_idx =
+                                minibatch_task_idx -
+                                minibatch_routed_gate_up_tasks;
+                            swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                                              &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
+                                              g.replayed_gate_up_ready, g.replayed_hidden_ready,
+                                              swiglu_fwd_inputs_arrived, swiglu_fwd_bitfield,
+                                              num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                                              macrobatch_idx, minibatch_idx,
+                                              task_idx, cta_rank, 0, 0, smem_base_addr);
+                        }
+                    } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                         // Replay gate GEMM refreshes the routed activation.
                         const int task_idx = minibatch_task_idx;
                         expert_grouped_gemm_kernel<false>(g.x_fp8_routed, g.w_routed_gate, &g.x_sc_routed, &g.w_routed_gate_sc, nullptr, nullptr, nullptr, nullptr,
@@ -1486,8 +1528,11 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         minibatch_routed_row_blocks * intermediate_dim_col_blocks +
         minibatch_routed_swiglu_bwd_tasks +
         minibatch_routed_row_blocks * hidden_dim_col_blocks;
+    const bool use_bf16_replay_paired_gate_up =
+        use_minibatch_release && NUM_DEVICES == 8 && num_macrobatches > 1;
     const int minibatch_routed_replay_tasks =
-        2 * minibatch_routed_row_blocks * intermediate_dim_col_blocks +
+        (use_bf16_replay_paired_gate_up ? 1 : 2) *
+            minibatch_routed_row_blocks * intermediate_dim_col_blocks +
         minibatch_routed_swiglu_fwd_tasks;
     const int segment_wgrad_tasks =
         3 * intermediate_dim_col_blocks * hidden_dim_col_blocks;

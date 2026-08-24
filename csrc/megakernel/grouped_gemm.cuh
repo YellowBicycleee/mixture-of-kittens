@@ -500,3 +500,250 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         }
     }
 }
+
+// BF16 B-sized Replay-only Gate+Up pair.  One M256N256 task keeps x in
+// shared memory while issuing independent Gate and Up MMAs into the two BF16
+// TMEM halves.  Three load stages fit A + B_gate + B_up in the existing
+// dynamic-SMEM envelope; the second MMA releases each stage only after both
+// consumers have read the shared x tile.
+template <bool ENABLED>
+static __device__ __forceinline__ void expert_grouped_gate_up_replay_kernel(
+    const routed_bf16_gl &x_gmem,
+    const weight_bf16_gl &w_gate_gmem,
+    const weight_bf16_gl &w_up_gmem,
+    const epi_bf16_gl &gate_gmem,
+    const epi_bf16_gl &up_gmem,
+    const index_gl &tokens_per_expert,
+    const index_gl &input_minibatch_ready,
+    const index_gl &output_tile_ready,
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> &gate_tt,
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> &up_tt,
+    semaphore (&gemm_inputs_arrived)[config::MLP_LOAD_PIPE_DEPTH],
+    semaphore (&gemm_inputs_finished)[config::MLP_LOAD_PIPE_DEPTH],
+    semaphore &gemm_outputs_arrived,
+    semaphore &gemm_outputs_finished,
+    uint32_t &gemm_bitfield,
+    const int num_tokens,
+    const int macrobatch_size,
+    const int minibatch_size,
+    const int macrobatch_idx,
+    const int minibatch_idx,
+    int task_idx,
+    const int cta_rank,
+    const uint64_t smem_base_addr
+) {
+    static_assert(ENABLED, "paired Gate+Up is only instantiated for BF16 B-sized Replay");
+    static constexpr int PAIRED_LOAD_PIPE_DEPTH = 3;
+    static_assert(PAIRED_LOAD_PIPE_DEPTH <= config::MLP_LOAD_PIPE_DEPTH);
+    using a_tile = mlp_bf16_tile;
+    using b_tile = mlp_bf16_tile;
+
+    auto (&a_smem)[PAIRED_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<a_tile (*)[PAIRED_LOAD_PIPE_DEPTH]>(smem_base_addr);
+    auto (&gate_b_smem)[PAIRED_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<b_tile (*)[PAIRED_LOAD_PIPE_DEPTH]>(
+            smem_base_addr + sizeof(a_smem));
+    auto (&up_b_smem)[PAIRED_LOAD_PIPE_DEPTH] =
+        *reinterpret_cast<b_tile (*)[PAIRED_LOAD_PIPE_DEPTH]>(
+            smem_base_addr + sizeof(a_smem) + sizeof(gate_b_smem));
+    // Keep D at the generic BF16 epilogue offset.  The persistent scheduler
+    // may let the next task's producer run before this task's epilogue exits;
+    // placing D immediately after the compact paired inputs would alias the
+    // next generic task's B stages 3/4.
+    static constexpr uint64_t GENERIC_BF16_D_OFFSET =
+        2 * config::MLP_LOAD_PIPE_DEPTH * sizeof(mlp_bf16_tile) +
+        3 * config::MLP_LOAD_PIPE_DEPTH * sizeof(mlp_sc_tile);
+    auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES] =
+        *reinterpret_cast<mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>(
+            (smem_base_addr + GENERIC_BF16_D_OFFSET + 1023) &
+            ~uint64_t(1023));
+    static_assert(
+        3 * PAIRED_LOAD_PIPE_DEPTH * sizeof(mlp_bf16_tile) <=
+            GENERIC_BF16_D_OFFSET,
+        "paired inputs overlap the shared generic BF16 epilogue region");
+    static_assert(
+        GENERIC_BF16_D_OFFSET +
+                config::MLP_NUM_BF16_D_TILES * sizeof(mlp_bf16_d_tile) +
+                1023 <=
+            config::DYNAMIC_SHARED_MEMORY,
+        "paired Gate+Up SMEM exceeds the megakernel launch envelope");
+
+    const int col_blocks = w_gate_gmem.rows() / config::MLP_Nb;
+    const int global_minibatch_idx =
+        macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
+    const int macrobatch_row_block_offset =
+        macrobatch_idx * (macrobatch_size / config::MLP_Mb);
+    const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
+    const int global_minibatch_routed_first_row_block =
+        global_minibatch_idx * minibatch_routed_row_blocks;
+
+    int3 tile_coord = {-1, -1, -1};
+    int global_row_block_offset = 0;
+    for (int expert_idx = 0; expert_idx < w_gate_gmem.depth(); ++expert_idx) {
+        const int expert_row_blocks =
+            tokens_per_expert[{expert_idx}] / config::MLP_Mb;
+        const int global_first_row_block =
+            max(global_minibatch_routed_first_row_block,
+                global_row_block_offset);
+        const int row_blocks = max(
+            0,
+            min(global_minibatch_routed_first_row_block +
+                    minibatch_routed_row_blocks,
+                global_row_block_offset + expert_row_blocks) -
+                global_first_row_block);
+        const int num_tasks = row_blocks * col_blocks;
+        if (task_idx < num_tasks) {
+            const int2 swizzled =
+                get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(
+                    row_blocks, col_blocks, task_idx);
+            tile_coord = {
+                global_first_row_block + swizzled.x -
+                    macrobatch_row_block_offset,
+                swizzled.y,
+                expert_idx};
+            break;
+        }
+        task_idx -= num_tasks;
+        global_row_block_offset += expert_row_blocks;
+    }
+    if (tile_coord.z < 0)
+        return;
+
+    const int gemm_iters = x_gmem.cols() / config::MLP_BF16_Kb;
+    if (warpgroup::groupid() == config::NUM_CONSUMERS) {
+        if (warpgroup::warpid() == 3 && warp::elect_leader()) {
+            const int minibatch_first_row =
+                global_minibatch_idx * minibatch_size;
+            const int minibatch_rows =
+                max(0, min(minibatch_size, num_tokens - minibatch_first_row));
+            const int input_ready_required_count =
+                ((minibatch_rows + config::DISPATCH_Mb - 1) /
+                 config::DISPATCH_Mb) *
+                ((x_gmem.cols() + config::DISPATCH_Nb - 1) /
+                 config::DISPATCH_Nb);
+            barrier_wait(input_minibatch_ready, global_minibatch_idx,
+                         input_ready_required_count);
+
+            int input_ring = 0;
+            for (int k_block = 0; k_block < gemm_iters; ++k_block) {
+                wait(gemm_inputs_finished[input_ring],
+                     get_phasebit<1>(gemm_bitfield, input_ring));
+                tma::cluster::load_async(
+                    a_smem[input_ring], x_gmem,
+                    {tile_coord.x * 2 + cta_rank, k_block},
+                    gemm_inputs_arrived[input_ring],
+                    static_cast<uint16_t>(1 << cta_rank), 0);
+                tma::cluster::load_async(
+                    gate_b_smem[input_ring], w_gate_gmem,
+                    {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block},
+                    gemm_inputs_arrived[input_ring],
+                    static_cast<uint16_t>(1 << cta_rank), 0);
+                tma::cluster::load_async(
+                    up_b_smem[input_ring], w_up_gmem,
+                    {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block},
+                    gemm_inputs_arrived[input_ring],
+                    static_cast<uint16_t>(1 << cta_rank), 0);
+                update_phasebit<1>(gemm_bitfield, input_ring);
+                input_ring =
+                    ring_advance<PAIRED_LOAD_PIPE_DEPTH>(input_ring);
+            }
+        } else if (cta_rank == 0 && warpgroup::warpid() == 0 &&
+                   warp::elect_leader()) {
+            int input_ring = 0;
+            wait(gemm_outputs_finished,
+                 get_phasebit<1>(gemm_bitfield,
+                                 config::MLP_LOAD_PIPE_DEPTH));
+            update_phasebit<1>(gemm_bitfield,
+                               config::MLP_LOAD_PIPE_DEPTH);
+            tensor_after_thread_sync();
+            for (int idx = 0; idx < gemm_iters; ++idx) {
+                tma::expect_bytes(
+                    gemm_inputs_arrived[input_ring],
+                    config::CLUSTER_SIZE *
+                        (sizeof(a_tile) + 2 * sizeof(b_tile)));
+                wait(gemm_inputs_arrived[input_ring],
+                     get_phasebit<0>(gemm_bitfield, input_ring));
+                if (idx == 0) {
+                    mm2_ABt(gate_tt, a_smem[input_ring],
+                            gate_b_smem[input_ring]);
+                    mm2_ABt(up_tt, a_smem[input_ring],
+                            up_b_smem[input_ring],
+                            gemm_inputs_finished[input_ring]);
+                } else {
+                    mma2_ABt(gate_tt, a_smem[input_ring],
+                             gate_b_smem[input_ring]);
+                    mma2_ABt(up_tt, a_smem[input_ring],
+                             up_b_smem[input_ring],
+                             gemm_inputs_finished[input_ring]);
+                }
+                update_phasebit<0>(gemm_bitfield, input_ring);
+                input_ring =
+                    ring_advance<PAIRED_LOAD_PIPE_DEPTH>(input_ring);
+            }
+            detail::tcgen05::commit<config::CLUSTER_SIZE>(
+                gemm_outputs_arrived);
+        }
+    } else {
+        using epilogue_group = group<WARPGROUP_WARPS>;
+        wait(gemm_outputs_arrived,
+             get_phasebit<0>(gemm_bitfield,
+                             config::MLP_LOAD_PIPE_DEPTH));
+        update_phasebit<0>(gemm_bitfield,
+                           config::MLP_LOAD_PIPE_DEPTH);
+
+        auto store_bf16 = [&](
+            tt<float, config::MLP_Mb / 2, config::MLP_Nb> &output_tt,
+            const epi_bf16_gl &output_gmem,
+            bool release_tmem) {
+            rt_bf<config::MLP_Mb / 8,
+                  config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>
+                d_reg[config::MLP_EPI_PIPE_DEPTH];
+#pragma unroll
+            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
+                warpgroup::load_async(
+                    d_reg[i],
+                    output_tt.template subtile<
+                        tt<float, config::MLP_Mb / 2,
+                           config::MLP_Nb /
+                               config::MLP_EPI_PIPE_DEPTH>>(
+                        0,
+                        config::MLP_Nb /
+                            config::MLP_EPI_PIPE_DEPTH * i));
+            tensor_load_wait();
+            warpgroup::sync(1);
+            if (release_tmem)
+                warpgroup::tma::cluster::arrive(
+                    gemm_outputs_finished, 0);
+#pragma unroll
+            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+                warpgroup::tma::store_async_read_wait<
+                    config::MLP_NUM_BF16_D_TILES - 1>();
+                warpgroup::sync(1);
+                warpgroup::store(
+                    d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                    d_reg[i]);
+                warpgroup::sync(1);
+                warpgroup::tma::store_async<
+                    dim::ROW, cache_policy::EVICT_FIRST>(
+                    output_gmem,
+                    d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                    {2 * tile_coord.x + cta_rank,
+                     config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+            }
+            warpgroup::tma::store_async_read_wait();
+        };
+
+        store_bf16(gate_tt, gate_gmem, false);
+        store_bf16(up_tt, up_gmem, true);
+        epilogue_group::sync(4);
+        if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
+            tma::store_async_wait();
+            const int ready_index =
+                (macrobatch_row_block_offset + tile_coord.x) *
+                    col_blocks +
+                tile_coord.y;
+            // One paired CTA replaces one Gate and one Up CTA arrival.
+            barrier_arrive(output_tile_ready, ready_index, 2);
+        }
+    }
+}

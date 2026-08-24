@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import random
+from collections import Counter
 
 
 MLP_MB = 256
@@ -137,12 +138,32 @@ def _task_widths(
     return minibatch_bwd_tasks, segment_wgrad_tasks
 
 
-def _replay_task_width(minibatch: int, intermediate: int) -> int:
+def _replay_task_width(
+    minibatch: int, intermediate: int, *, paired_gate_up: bool = False
+) -> int:
     row_blocks = minibatch // MLP_MB
     intermediate_blocks = intermediate // MLP_MB
     swiglu_tiles = (minibatch // 128) * (intermediate // 128)
     swiglu_tasks = (swiglu_tiles + 6 - 1) // 6
-    return 2 * row_blocks * intermediate_blocks + swiglu_tasks
+    gate_up_tasks = row_blocks * intermediate_blocks
+    return (1 if paired_gate_up else 2) * gate_up_tasks + swiglu_tasks
+
+
+def _paired_replay_enabled(
+    *,
+    minibatch_release: bool,
+    num_devices: int,
+    use_mxfp8: bool,
+    full_context: bool,
+    num_macrobatches: int,
+) -> bool:
+    return (
+        minibatch_release
+        and num_devices == 8
+        and not use_mxfp8
+        and not full_context
+        and num_macrobatches > 1
+    )
 
 
 def _completed_segment_offsets(
@@ -257,6 +278,7 @@ def _assert_task_owner_case(
     hidden: int,
     intermediate: int,
     replay: bool = False,
+    paired_gate_up: bool = False,
 ) -> list[int]:
     completed = _completed_segment_offsets(
         tokens_per_expert, macrobatch, minibatch
@@ -265,7 +287,13 @@ def _assert_task_owner_case(
         minibatch, hidden, intermediate
     )
     saved_context_minibatches = macrobatch // minibatch
-    replay_tasks = _replay_task_width(minibatch, intermediate) if replay else 0
+    replay_tasks = (
+        _replay_task_width(
+            minibatch, intermediate, paired_gate_up=paired_gate_up
+        )
+        if replay
+        else 0
+    )
     prefixes = _task_prefixes(
         completed,
         minibatch_tasks,
@@ -454,3 +482,179 @@ def test_qwen_100k_b131072_replay_task_count_and_bucket_capacity() -> None:
     for idx in sampled_indices:
         decoded = _bucket_decode(prefixes, buckets, bucket_shift, idx)
         assert decoded == _binary_task_owner(prefixes, idx)
+
+
+def test_qwen_100k_paired_replay_counts_and_bucket_capacity() -> None:
+    expert_blocks = [64] * 32 + [63] * 16 + [62] * 16
+    random.Random(0).shuffle(expert_blocks)
+    tokens = [blocks * MLP_MB for blocks in expert_blocks]
+    macrobatch = 131072
+    minibatch = 4096
+    completed = _completed_segment_offsets(tokens, macrobatch, minibatch)
+    bwd_tasks, segment_tasks = _task_widths(minibatch, 4096, 1024)
+    old_replay_tasks = _replay_task_width(minibatch, 1024)
+    paired_replay_tasks = _replay_task_width(
+        minibatch, 1024, paired_gate_up=True
+    )
+    saved = macrobatch // minibatch
+    old_prefixes = _task_prefixes(
+        completed, bwd_tasks, segment_tasks, saved, old_replay_tasks
+    )
+    paired_prefixes = _task_prefixes(
+        completed, bwd_tasks, segment_tasks, saved, paired_replay_tasks
+    )
+    bucket_shift = bwd_tasks.bit_length() - 1
+    buckets = _build_task_owner_buckets(
+        paired_prefixes, 1 << bucket_shift
+    )
+
+    assert bwd_tasks == 384
+    assert segment_tasks == 192
+    assert old_replay_tasks == 171
+    assert paired_replay_tasks == 107
+    assert len(completed) - 1 == 253
+    assert saved == 32
+    assert len(completed) - 1 - saved == 221
+    assert completed[-1] == 71
+    assert old_prefixes[-1] == 148575
+    assert paired_prefixes[-1] == 134431
+    assert old_prefixes[-1] - paired_prefixes[-1] == 221 * 64
+    assert len(buckets) == 526
+    assert 1 << bucket_shift == 256
+
+    # The 100K harness reserves 4,096,000 routed rows even though this seeded
+    # fixture executes 1,036,288.  Keep host launch capacity, device retirement,
+    # and the compact Replay width on the same accounting contract.
+    shared_tasks = 9792
+    capacity_minibatches = 1000
+    capacity_macrobatches = 32
+    capacity_replay_minibatches = capacity_minibatches - saved
+    max_completed_segments = capacity_macrobatches + len(tokens) - 1
+    old_host_clusters = (
+        shared_tasks
+        + capacity_minibatches * bwd_tasks
+        + capacity_replay_minibatches * old_replay_tasks
+        + max_completed_segments * segment_tasks
+    )
+    paired_host_clusters = (
+        shared_tasks
+        + capacity_minibatches * bwd_tasks
+        + capacity_replay_minibatches * paired_replay_tasks
+        + max_completed_segments * segment_tasks
+    )
+    assert (old_host_clusters, paired_host_clusters) == (577560, 515608)
+    assert (2 * old_host_clusters + 44, 2 * paired_host_clusters + 44) == (
+        1155164,
+        1031260,
+    )
+
+    old_device_clusters = shared_tasks + old_prefixes[-1]
+    paired_device_clusters = shared_tasks + paired_prefixes[-1]
+    assert (old_device_clusters, paired_device_clusters) == (158367, 144223)
+    assert (2 * old_device_clusters + 44, 2 * paired_device_clusters + 44) == (
+        316778,
+        288490,
+    )
+
+    replay_dispatch_arrivals = (minibatch // 128) * (4096 // 512)
+    legacy_gate_up_ready = 2 * 2
+    paired_gate_up_ready = 1 * 2 * 2
+    assert replay_dispatch_arrivals == 256
+    assert legacy_gate_up_ready == paired_gate_up_ready == 4
+
+    assert (old_prefixes[31], paired_prefixes[31]) == (13248, 13248)
+    assert old_prefixes[32] == paired_prefixes[32] == 14016
+    assert (old_prefixes[33], paired_prefixes[33]) == (14571, 14507)
+    assert (old_prefixes[252], paired_prefixes[252]) == (147828, 133748)
+
+    for idx in range(paired_prefixes[-1]):
+        assert _bucket_decode(
+            paired_prefixes, buckets, bucket_shift, idx
+        ) == _binary_task_owner(paired_prefixes, idx)
+
+
+def test_qwen_100k_paired_replay_work_identity() -> None:
+    expert_blocks = [64] * 32 + [63] * 16 + [62] * 16
+    random.Random(0).shuffle(expert_blocks)
+    tokens = [blocks * MLP_MB for blocks in expert_blocks]
+    macrobatch = 131072
+    minibatch = 4096
+    completed = _completed_segment_offsets(tokens, macrobatch, minibatch)
+    bwd_tasks, segment_tasks = _task_widths(minibatch, 4096, 1024)
+    old_replay_tasks = _replay_task_width(minibatch, 1024)
+    paired_replay_tasks = _replay_task_width(
+        minibatch, 1024, paired_gate_up=True
+    )
+    saved = macrobatch // minibatch
+    old_prefixes = _task_prefixes(
+        completed, bwd_tasks, segment_tasks, saved, old_replay_tasks
+    )
+    paired_prefixes = _task_prefixes(
+        completed, bwd_tasks, segment_tasks, saved, paired_replay_tasks
+    )
+    bucket_shift = bwd_tasks.bit_length() - 1
+    buckets = _build_task_owner_buckets(
+        paired_prefixes, 1 << bucket_shift
+    )
+    gate_up_tasks = (minibatch // MLP_MB) * (1024 // MLP_MB)
+
+    expanded = Counter()
+    paired_tasks = 0
+    for physical_idx in range(paired_prefixes[-1]):
+        owner, local = _bucket_decode(
+            paired_prefixes, buckets, bucket_shift, physical_idx
+        )
+        if owner < saved:
+            expanded[(owner, local)] += 1
+        elif local < gate_up_tasks:
+            expanded[(owner, local)] += 1
+            expanded[(owner, gate_up_tasks + local)] += 1
+            paired_tasks += 1
+        else:
+            expanded[(owner, local + gate_up_tasks)] += 1
+
+    canonical = Counter(
+        (owner, local)
+        for owner in range(len(old_prefixes) - 1)
+        for local in range(old_prefixes[owner + 1] - old_prefixes[owner])
+    )
+    assert expanded == canonical
+    assert paired_tasks == 221 * 64 == 14144
+    assert sum(expanded.values()) == old_prefixes[-1] == 148575
+
+
+def test_paired_replay_identity_guards_and_small_routing_cases() -> None:
+    target = {
+        "minibatch_release": True,
+        "num_devices": 8,
+        "use_mxfp8": False,
+        "full_context": False,
+        "num_macrobatches": 2,
+    }
+    assert _paired_replay_enabled(**target)
+    for key, identity_value in (
+        ("minibatch_release", False),
+        ("num_devices", 4),
+        ("use_mxfp8", True),
+        ("full_context", True),
+        ("num_macrobatches", 1),
+    ):
+        identity = dict(target)
+        identity[key] = identity_value
+        assert not _paired_replay_enabled(**identity)
+
+    cases = [
+        ([0, 512, 0, 768, 256], 512, 256, 1024, 512),
+        ([768, 0, 256, 512], 512, 256, 2048, 1024),
+        ([0, 768, 256, 0, 768], 1024, 512, 4096, 1024),
+    ]
+    for tokens, macrobatch, minibatch, hidden, intermediate in cases:
+        assert _assert_task_owner_case(
+            tokens,
+            macrobatch,
+            minibatch,
+            hidden,
+            intermediate,
+            replay=True,
+            paired_gate_up=True,
+        ) == _completed_segment_offsets(tokens, macrobatch, minibatch)
