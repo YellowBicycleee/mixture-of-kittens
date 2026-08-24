@@ -1,11 +1,8 @@
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(const globals_fwd &g) {
-    // BF16 keeps two CLC result slots so the scheduler can obtain task t+2
-    // without waiting for the consumer tail of task t.  This removes a task-ID
-    // reuse barrier from the existing TMA/TC/SwiGLU warp specialization.  Keep
-    // MXFP8 and all non-forward kernels on the single-result schedule.
-    static constexpr int FWD_CLC_PIPE_DEPTH =
-        NUM_DEVICES == 8 && !USE_MXFP8 ? 2 : config::CLC_PIPE_DEPTH;
+    // The EP8 BF16 forward selector may keep two CLC result slots so the
+    // scheduler can obtain task t+2 without waiting for the consumer tail of
+    // task t.  Every other path keeps its original single-result schedule.
     static_assert(FWD_CLC_PIPE_DEPTH > 0);
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
