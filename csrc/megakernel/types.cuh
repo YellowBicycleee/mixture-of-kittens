@@ -19,10 +19,9 @@ struct config {
     static constexpr int SWIGLU_Nb = 128;
     // A CLC task serially executes this many complete raw output tiles.  This
     // tunes scheduler/launch granularity without changing either GEMM tile.
-    static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE =
-        NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1;
+    static constexpr int FUSED_GATE_UP_TASK_GROUP_SIZE = 1;
     static constexpr int FUSED_DOWN_TASK_GROUP_SIZE =
-        NUM_DEVICES == 8 && USE_MXFP8 ? 4 : 1;
+        NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1;
     static constexpr int SWIGLU_FWD_PIPE_DEPTH = 3; // gate / up
     static constexpr int SWIGLU_BWD_PIPE_DEPTH = 2; // gate / up / d_hidden
 
