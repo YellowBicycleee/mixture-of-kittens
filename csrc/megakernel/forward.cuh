@@ -1,5 +1,12 @@
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(const globals_fwd &g) {
+    // BF16 keeps two CLC result slots so the scheduler can obtain task t+2
+    // without waiting for the consumer tail of task t.  This removes a task-ID
+    // reuse barrier from the existing TMA/TC/SwiGLU warp specialization.  Keep
+    // MXFP8 and all non-forward kernels on the single-result schedule.
+    static constexpr int FWD_CLC_PIPE_DEPTH =
+        NUM_DEVICES == 8 && !USE_MXFP8 ? 2 : config::CLC_PIPE_DEPTH;
+    static_assert(FWD_CLC_PIPE_DEPTH > 0);
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
@@ -47,9 +54,9 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     uint32_t dispatch_bitfield = 0xFFFF0000;
     uint32_t combine_bitfield = 0xFFFF0000;
 
-    __shared__ clc::handle clc_handle[config::CLC_PIPE_DEPTH];
+    __shared__ clc::handle clc_handle[FWD_CLC_PIPE_DEPTH];
     __shared__ clc::handle clc_drain_handle[config::CLC_DRAIN_PIPE_DEPTH];
-    __shared__ semaphore schedule_arrived[config::CLC_PIPE_DEPTH], schedule_finished[config::CLC_PIPE_DEPTH];
+    __shared__ semaphore schedule_arrived[FWD_CLC_PIPE_DEPTH], schedule_finished[FWD_CLC_PIPE_DEPTH];
     __shared__ semaphore drain_schedule_arrived[config::CLC_DRAIN_PIPE_DEPTH];
     __shared__ semaphore drain_schedule_finished[config::CLC_DRAIN_PIPE_DEPTH];
     __shared__ semaphore gemm_inputs_arrived[config::MLP_LOAD_PIPE_DEPTH];
@@ -71,7 +78,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
         init_semaphore(gemm_outputs_arrived, 0, 1);
         init_semaphore(gemm_outputs_finished, 0, config::CLUSTER_SIZE);
         #pragma unroll
-        for (int i = 0; i < config::CLC_PIPE_DEPTH; ++i) {
+        for (int i = 0; i < FWD_CLC_PIPE_DEPTH; ++i) {
             init_semaphore(schedule_arrived[i], 0, 1);
             init_semaphore(schedule_finished[i], 0, config::CLUSTER_SIZE * config::NUM_WARPS);
         }
@@ -147,10 +154,10 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     const int hidden_row_block_ready_required_count = (config::MLP_Mb / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
 
     for (int task_iter = 0; cluster_idx >= 0 && cluster_idx < true_num_clusters; ++task_iter) {
-        const int clc_stage = task_iter % config::CLC_PIPE_DEPTH;
+        const int clc_stage = task_iter % FWD_CLC_PIPE_DEPTH;
         if (warpgroup::groupid() == config::NUM_CONSUMERS && warpgroup::warpid() == 1 && warp::elect_leader()) { // warp not used by the gemms
             if (cta_rank == 0) {
-                wait(schedule_finished[clc_stage], ((task_iter + config::CLC_PIPE_DEPTH) / config::CLC_PIPE_DEPTH) % 2);
+                wait(schedule_finished[clc_stage], ((task_iter + FWD_CLC_PIPE_DEPTH) / FWD_CLC_PIPE_DEPTH) % 2);
                 clc::schedule(clc_handle[clc_stage], schedule_arrived[clc_stage]);
             }
             tma::expect_bytes(schedule_arrived[clc_stage], sizeof(clc_handle[clc_stage]));
@@ -252,7 +259,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
             }
         }
 
-        wait(schedule_arrived[clc_stage], (task_iter / config::CLC_PIPE_DEPTH) % 2);
+        wait(schedule_arrived[clc_stage], (task_iter / FWD_CLC_PIPE_DEPTH) % 2);
         const auto schedule = clc::query(clc_handle[clc_stage]);
         cluster_idx = schedule.success ? static_cast<int>(schedule.x / config::CLUSTER_SIZE) : -1;
         __syncwarp();
