@@ -138,6 +138,10 @@ ring](docs/bwd-ep8-minibatch-pipeline.md) for the execution contract, memory
 cost, complete per-macrobatch measurements, bandwidth definition, and current
 limitations.
 
+See the [BF16 EP8 B-sized Replay backward update](docs/updates/2026-08-25-bf16-ep8-replay-bwd/README.md)
+for the minibatch scheduling changes, correctness contract, measured B300
+results, and current limitations.
+
 Set these values when constructing `MoKConfig`, and pass the selected
 configuration for that call to the functional layer.
 
