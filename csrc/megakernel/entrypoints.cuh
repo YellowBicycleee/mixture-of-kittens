@@ -5,6 +5,11 @@
 
 #include "megakernel.cuh"
 
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <type_traits>
+
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor>
@@ -133,12 +138,68 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 8:
-            return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
-                x, x_ptrs, combine_buffer, combine_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 8: {
+            using I1 = std::integral_constant<int, 1>;
+            using I2 = std::integral_constant<int, 2>;
+            using I4 = std::integral_constant<int, 4>;
+
+            auto launch_ep8 = [&](auto clc_tag, auto gate_tag, auto down_tag) {
+                constexpr int CLC = decltype(clc_tag)::value;
+                constexpr int G = decltype(gate_tag)::value;
+                constexpr int D = decltype(down_tag)::value;
+                using impl = dispatch_mlp_swiglu_combiner<
+                    8, RoutedPrecision::BF16, CLC, G, D>;
+                return impl::dispatch_mlp_swiglu_combine_fwd_bf16(
+                    x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+                    w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                    w_shared_down, w_routed_down,
+                    schedule_peer_rank, schedule_peer_token_idx,
+                    num_tokens, tokens_per_expert,
+                    topk, swiglu_limit, num_comm_sms,
+                    macrobatch_size, minibatch_size);
+            };
+
+            const char *clc_depth = std::getenv("MOK_FWD_EP8_BF16_CLC_DEPTH");
+            const char *grouping = std::getenv("MOK_FWD_EP8_BF16_GROUPING");
+            if (clc_depth == nullptr || clc_depth[0] == '\0') {
+                clc_depth = "1";
+            }
+            if (grouping == nullptr || grouping[0] == '\0') {
+                grouping = "G1D1";
+            }
+
+            if (std::strcmp(clc_depth, "1") == 0) {
+                if (std::strcmp(grouping, "G1D1") == 0) {
+                    return launch_ep8(I1{}, I1{}, I1{});
+                }
+                throw std::runtime_error(
+                    "MOK_FWD_EP8_BF16_CLC_DEPTH=1 supports only G1D1");
+            }
+            if (std::strcmp(clc_depth, "2") == 0) {
+                if (std::strcmp(grouping, "G1D1") == 0) {
+                    return launch_ep8(I2{}, I1{}, I1{});
+                }
+                if (std::strcmp(grouping, "G1D2") == 0) {
+                    return launch_ep8(I2{}, I1{}, I2{});
+                }
+                if (std::strcmp(grouping, "G1D4") == 0) {
+                    return launch_ep8(I2{}, I1{}, I4{});
+                }
+                if (std::strcmp(grouping, "G2D1") == 0) {
+                    return launch_ep8(I2{}, I2{}, I1{});
+                }
+                if (std::strcmp(grouping, "G2D2") == 0) {
+                    return launch_ep8(I2{}, I2{}, I2{});
+                }
+                if (std::strcmp(grouping, "G2D4") == 0) {
+                    return launch_ep8(I2{}, I2{}, I4{});
+                }
+                throw std::runtime_error(
+                    "invalid MOK_FWD_EP8_BF16_GROUPING for CLC depth 2");
+            }
+            throw std::runtime_error(
+                "MOK_FWD_EP8_BF16_CLC_DEPTH must be 1 or 2");
+        }
         case 16:
             return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,

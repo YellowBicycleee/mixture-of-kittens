@@ -17,10 +17,28 @@ enum class RoutedPrecision {
     MXFP8,
 };
 
-template <int NUM_DEVICES, RoutedPrecision ROUTED_PRECISION = RoutedPrecision::MXFP8>
+template <
+    int NUM_DEVICES,
+    RoutedPrecision ROUTED_PRECISION = RoutedPrecision::MXFP8,
+    int FWD_CLC_PIPE_DEPTH = 1,
+    int FWD_GATE_GROUP_SIZE = 1,
+    int FWD_DOWN_GROUP_SIZE =
+        (NUM_DEVICES == 8 && ROUTED_PRECISION == RoutedPrecision::MXFP8 ? 2 : 1)>
 struct dispatch_mlp_swiglu_combiner {
 
 static constexpr bool USE_MXFP8 = ROUTED_PRECISION == RoutedPrecision::MXFP8;
+
+static_assert(
+    (FWD_CLC_PIPE_DEPTH == 1 &&
+     FWD_GATE_GROUP_SIZE == 1 &&
+     FWD_DOWN_GROUP_SIZE == (NUM_DEVICES == 8 && USE_MXFP8 ? 2 : 1)) ||
+    (NUM_DEVICES == 8 && !USE_MXFP8 &&
+     FWD_CLC_PIPE_DEPTH == 2 &&
+     (FWD_GATE_GROUP_SIZE == 1 || FWD_GATE_GROUP_SIZE == 2) &&
+     (FWD_DOWN_GROUP_SIZE == 1 ||
+      FWD_DOWN_GROUP_SIZE == 2 ||
+      FWD_DOWN_GROUP_SIZE == 4)),
+    "unsupported MoK forward CLC/group configuration");
 
 #include "types.cuh"
 
@@ -28,6 +46,7 @@ static constexpr bool USE_MXFP8 = ROUTED_PRECISION == RoutedPrecision::MXFP8;
 #include "dispatch_combine.cuh"
 #include "swiglu.cuh"
 #include "grouped_gemm.cuh"
+#include "fused_gate_up.cuh"
 
 #include "forward.cuh"
 #include "backward.cuh"

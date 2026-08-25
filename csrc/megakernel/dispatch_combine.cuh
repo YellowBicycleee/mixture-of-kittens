@@ -95,29 +95,87 @@ static __device__ __forceinline__ void dispatch_kernel(
     update_phasebit<0>(bitfield, 0);
 
     if constexpr (USE_MXFP8) {
-        // Quantize each 128x128 subtile of the staging buffer
+        // Forward only needs the transposed activation saved for macrobatch 0;
+        // later macrobatches recreate it during backward replay. A null
+        // transposed destination therefore selects the normal-only path.
+        const bool return_transposed = x_t_gmem != nullptr;
+
+        // Quantize each 128x128 subtile of the staging buffer.
         const int row_block = row_idx / config::QUANT_Mb;
         const int num_subtiles = chunk_cols / config::QUANT_Nb;
-        for (int subtile = 0; subtile < config::DISPATCH_Nb / config::QUANT_Nb; ++subtile) {
-            if (subtile < num_subtiles) {
-                const auto &x_bf16_subtile = *reinterpret_cast<const quant_bf16_tile *>(
-                    smem_base_addr + subtile * config::QUANT_Nb * sizeof(bf16));
-                const int out = subtile % config::DISPATCH_OUT_TILES;
+        if (return_transposed) {
+            for (int subtile = 0; subtile < config::DISPATCH_Nb / config::QUANT_Nb; ++subtile) {
+                if (subtile < num_subtiles) {
+                    const auto &x_bf16_subtile = *reinterpret_cast<const quant_bf16_tile *>(
+                        smem_base_addr + subtile * config::QUANT_Nb * sizeof(bf16));
+                    const int out = subtile % config::DISPATCH_OUT_TILES;
 
-                if (tid == 0) tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
-                __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
-                if constexpr (!SCALE_ROWS)
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
-                else
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
-                __syncthreads(); // quantized tiles must be complete before TMA reads them
+                    if (tid == 0)
+                        tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
+                    __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
+                    if constexpr (!SCALE_ROWS)
+                        mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
+                    else
+                        mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                    __syncthreads(); // quantized tiles must be complete before TMA reads them
+
+                    if (tid == 0) {
+                        const int col_block = col_block_idx * (config::DISPATCH_Nb / config::QUANT_Nb) + subtile;
+                        tma::store_async(x_gmem, x_fp8_tiles[out], {row_block, col_block});
+                        tma::store_async(*x_sc_gmem, x_sc_tiles[out], {row_block, col_block, 0, 0});
+                        tma::store_async(*x_t_gmem, x_fp8_t_tiles[out], {col_block, row_block});
+                        tma::store_async(*x_sc_t_gmem, x_sc_t_tiles[out], {col_block, row_block, 0, 0});
+                    }
+                }
+            }
+        } else {
+            // The transpose buffers are dead for replayed forward macros. Use
+            // their two output slots as extra normal-output storage so the two
+            // 128-thread groups quantize adjacent subtiles in parallel without
+            // waiting for an earlier TMA store to release a ring slot.
+            static_assert(config::NUM_THREADS == 2 * config::QUANT_Mb);
+            static_assert(config::DISPATCH_Nb / config::QUANT_Nb == 2 * config::DISPATCH_OUT_TILES);
+            const int worker_group = tid / config::QUANT_Mb;
+            const int worker_tid = tid % config::QUANT_Mb;
+
+            __syncthreads(); // makes zero-filled rows visible before normal quantization
+            #pragma unroll
+            for (int pair = 0; pair < config::DISPATCH_OUT_TILES; ++pair) {
+                const int subtile = pair * 2 + worker_group;
+                const int out = subtile % config::DISPATCH_OUT_TILES;
+                if (subtile < num_subtiles) {
+                    const auto &x_bf16_subtile = *reinterpret_cast<const quant_bf16_tile *>(
+                        smem_base_addr + subtile * config::QUANT_Nb * sizeof(bf16));
+                    if (subtile < config::DISPATCH_OUT_TILES) {
+                        if constexpr (!SCALE_ROWS)
+                            mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, false, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, worker_tid, 1);
+                        else
+                            mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, true, false> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, worker_tid, 1);
+                    } else {
+                        if constexpr (!SCALE_ROWS)
+                            mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, false, false>(x_bf16_subtile, x_fp8_t_tiles[out], x_sc_t_tiles[out], x_fp8_tiles[out], x_sc_tiles[out], nullptr, worker_tid, 1);
+                        else
+                            mxfp8::quantize_tile<true, false, config::DISPATCH_Nb, false, true, false> (x_bf16_subtile, x_fp8_t_tiles[out], x_sc_t_tiles[out], x_fp8_tiles[out], x_sc_tiles[out], router_weights_smem, worker_tid, 1);
+                    }
+                }
+                __syncthreads(); // both normal tiles must be complete before lane 0 issues their stores
 
                 if (tid == 0) {
-                    const int col_block = col_block_idx * (config::DISPATCH_Nb / config::QUANT_Nb) + subtile;
-                    tma::store_async(x_gmem, x_fp8_tiles[out], {row_block, col_block});
-                    tma::store_async(*x_sc_gmem, x_sc_tiles[out], {row_block, col_block, 0, 0});
-                    tma::store_async(*x_t_gmem, x_fp8_t_tiles[out], {col_block, row_block});
-                    tma::store_async(*x_sc_t_gmem, x_sc_t_tiles[out], {col_block, row_block, 0, 0});
+                    #pragma unroll
+                    for (int slot = 0; slot < 2; ++slot) {
+                        const int store_subtile = pair * 2 + slot;
+                        const int store_out = store_subtile % config::DISPATCH_OUT_TILES;
+                        if (store_subtile < num_subtiles) {
+                            const int col_block = col_block_idx * (config::DISPATCH_Nb / config::QUANT_Nb) + store_subtile;
+                            if (store_subtile < config::DISPATCH_OUT_TILES) {
+                                tma::store_async(x_gmem, x_fp8_tiles[store_out], {row_block, col_block});
+                                tma::store_async(*x_sc_gmem, x_sc_tiles[store_out], {row_block, col_block, 0, 0});
+                            } else {
+                                tma::store_async(x_gmem, x_fp8_t_tiles[store_out], {row_block, col_block});
+                                tma::store_async(*x_sc_gmem, x_sc_t_tiles[store_out], {row_block, col_block, 0, 0});
+                            }
+                        }
+                    }
                 }
             }
         }
