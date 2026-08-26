@@ -15,6 +15,7 @@ contract = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(contract)
 _FORWARD_SOURCE = (_CONTRACT_PATH.parent / "forward.py").read_text()
 _FORWARD_TREE = ast.parse(_FORWARD_SOURCE)
+_TMA_SOURCE = (_CONTRACT_PATH.parent / "_tma_1d.py").read_text()
 _QUACK_SOURCE = (_CONTRACT_PATH.parent / "quack_gemm.py").read_text()
 _QUACK_TREE = ast.parse(_QUACK_SOURCE)
 _FUNCTIONAL_SOURCE = (_CONTRACT_PATH.parents[1] / "functional.py").read_text()
@@ -287,6 +288,20 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
             contract.dispatch_task_coordinates(1023, 4096),
             (3968, 3968),
         )
+
+    def test_dispatch_publishes_expected_bytes_before_raw_tma_load(self) -> None:
+        expect = _FORWARD_SOURCE.index(
+            "cute.arch.mbarrier_arrive_and_expect_tx("
+        )
+        load = _FORWARD_SOURCE.index("tma_load_1d_raw(", expect)
+        wait = _FORWARD_SOURCE.index("cute.arch.mbarrier_wait(", load)
+        self.assertLess(expect, load)
+        self.assertLess(load, wait)
+        # These helpers emit direct PTX and bypass cute.copy's version-specific
+        # elect_one lowering in CUTLASS DSL 4.6.x.
+        self.assertIn("llvm.inline_asm(", _TMA_SOURCE)
+        self.assertNotIn("cute.copy", _TMA_SOURCE)
+        self.assertNotIn("elect_one", _TMA_SOURCE)
 
     def test_combine_tasks_match_cuda_16_by_1024_geometry(self) -> None:
         self.assertEqual(contract.COMBINE_ROW_CHUNK_BYTES, 2048)

@@ -228,14 +228,17 @@ class _DispatchKernel:
                     # This worker is the sole producer and consumer of its
                     # row mbarrier.  Wait for peer GMEM -> SMEM to complete
                     # before the same bytes are submitted as SMEM -> ring.
+                    # Publish the expected transaction bytes before issuing
+                    # the raw TMA load.  Reversing these operations races a
+                    # fast completion and can leave the waiter stuck.
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbarrier, Int32(DISPATCH_CHUNK_BYTES)
+                    )
                     tma_load_1d_raw(
                         row_chunk,
                         src_address,
                         mbarrier,
                         Int32(DISPATCH_CHUNK_BYTES),
-                    )
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        mbarrier, Int32(DISPATCH_CHUNK_BYTES)
                     )
                     cute.arch.mbarrier_wait(mbarrier, phase)
                     phase = phase ^ Int32(1)
