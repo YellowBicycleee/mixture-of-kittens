@@ -3,6 +3,8 @@
 #include "kittens.cuh"
 #include "pyutils/torchutils.cuh"
 
+#include <cooperative_groups.h>
+
 #include "../mxfp8.cuh"
 #include "../utils.cuh"
 
@@ -47,6 +49,8 @@ static_assert(
 #include "swiglu.cuh"
 #include "grouped_gemm.cuh"
 #include "fused_gate_up.cuh"
+#include "forward_ep8_bf16_ws_layout.cuh"
+#include "forward_ep8_bf16_warp_specialized.cuh"
 
 #include "forward.cuh"
 #include "backward.cuh"

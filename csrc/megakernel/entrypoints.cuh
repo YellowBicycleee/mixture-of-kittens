@@ -139,6 +139,28 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         case 8: {
+            const char *warp_specialized =
+                std::getenv("MOK_FWD_EP8_BF16_WARP_SPECIALIZED");
+            if (warp_specialized != nullptr) {
+                if (std::strcmp(warp_specialized, "1") == 0) {
+                    return dispatch_mlp_swiglu_combiner<
+                        8, RoutedPrecision::BF16>::
+                        dispatch_mlp_swiglu_combine_fwd_bf16_ep8_warp_specialized(
+                            x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+                            w_shared_gate, w_routed_gate,
+                            w_shared_up, w_routed_up,
+                            w_shared_down, w_routed_down,
+                            schedule_peer_rank, schedule_peer_token_idx,
+                            num_tokens, tokens_per_expert,
+                            topk, swiglu_limit, num_comm_sms,
+                            macrobatch_size, minibatch_size);
+                }
+                if (std::strcmp(warp_specialized, "0") != 0) {
+                    throw std::runtime_error(
+                        "MOK_FWD_EP8_BF16_WARP_SPECIALIZED must be 0 or 1");
+                }
+            }
+
             using I1 = std::integral_constant<int, 1>;
             using I2 = std::integral_constant<int, 2>;
             using I4 = std::integral_constant<int, 4>;

@@ -456,7 +456,8 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    bool use_ep8_bf16_warp_specialized = false
 ) {
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
@@ -543,9 +544,68 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (use_ep8_bf16_warp_specialized) {
+        if constexpr (
+            NUM_DEVICES == 8
+            && FWD_CLC_PIPE_DEPTH == 1
+            && FWD_GATE_GROUP_SIZE == 1
+            && FWD_DOWN_GROUP_SIZE == 1) {
+            if (swiglu_limit.has_value())
+                launch_fwd_ep8_bf16_warp_specialized<true>(g);
+            else
+                launch_fwd_ep8_bf16_warp_specialized<false>(g);
+        } else {
+            TORCH_CHECK(
+                false,
+                "MoK EP8 BF16 warp specialization requires EP8 canonical "
+                "CLC1/G1/D1 host specialization");
+        }
+    } else if (swiglu_limit.has_value()) {
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
-    else
+    } else {
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>(g);
+    }
     return {x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed};
+}
+
+// Opt-in EP8 BF16 training fast path.  It intentionally reuses the exact
+// legacy allocations and return ABI: only the device launch topology changes.
+// In particular Gate, Up, and Hidden remain materialized for backward.
+static __host__ __forceinline__ std::tuple<
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+dispatch_mlp_swiglu_combine_fwd_bf16_ep8_warp_specialized(
+    const at::Tensor &x,
+    const std::vector<int64_t> &x_ptrs,
+    const at::Tensor &combine_buffer,
+    const std::vector<int64_t> &combine_buffer_ptrs,
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_shared_down,
+    const at::Tensor &w_routed_down,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+    int topk,
+    std::optional<float> swiglu_limit,
+    int num_comm_sms,
+    int macrobatch_size,
+    int minibatch_size
+) {
+    static_assert(NUM_DEVICES == 8);
+    static_assert(!USE_MXFP8);
+    static_assert(FWD_CLC_PIPE_DEPTH == 1);
+    static_assert(FWD_GATE_GROUP_SIZE == 1);
+    static_assert(FWD_DOWN_GROUP_SIZE == 1);
+    return dispatch_mlp_swiglu_combine_fwd_bf16(
+        x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+        w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+        w_shared_down, w_routed_down,
+        schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, tokens_per_expert,
+        topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        true);
 }
