@@ -3,10 +3,12 @@
 
 Run on one eight-B300 node with ``torchrun --standalone --nproc-per-node=8``.
 The two small cases check one- and two-macro correctness.  The 100K/rank case
-uses a 32K macrobatch, first screens six CUDA communication-SM counts, then
-runs the winner in CUDA-CuTe-CuTe-CUDA W10/N30 order.  CUDA Events bracket only
-``functional.forward``; schedule construction and the first CuTe compilation
-call are outside the measured boundary.
+uses a 32K macrobatch and captures the raw nine-tensor forward ABI before BWD
+can rewrite its ring buffers.  A parity failure is fsynced as per-rank JSON
+before raising.  Only after parity, six CUDA communication-SM counts are
+screened and the winner runs in CUDA-CuTe-CuTe-CUDA W10/N30 order.  CUDA Events
+bracket only ``functional.forward``; schedule construction and the first CuTe
+compilation call are outside the measured boundary.
 """
 
 from __future__ import annotations
@@ -40,6 +42,17 @@ RESULT_NAMES = (
     "d_w_shared_up",
     "d_w_shared_down",
 )
+FORWARD_CONTEXT_NAMES = (
+    "x_routed",
+    "gate_shared",
+    "gate_routed",
+    "up_shared",
+    "up_routed",
+    "hidden_shared",
+    "hidden_routed",
+    "y_shared",
+    "y_routed",
+)
 
 
 def static_self_test() -> dict[str, object]:
@@ -51,6 +64,8 @@ def static_self_test() -> dict[str, object]:
     assert MACROBATCH % MINIBATCH == 0
     assert CUDA_COMM_CANDIDATES == (36, 40, 44, 48, 52, 56)
     assert len(RESULT_NAMES) == 9
+    assert len(FORWARD_CONTEXT_NAMES) == 9
+    assert json_number(float("nan")) is None and json_number(1.25) == 1.25
     return {
         "status": "PASS",
         "dtype": "BF16",
@@ -142,6 +157,152 @@ def all_ranks_true(value: bool, device) -> bool:
     return bool(flag.item())
 
 
+def json_number(value: float | None) -> float | None:
+    return value if value is not None and math.isfinite(value) else None
+
+
+def parity_metric(name: str, category: str, reference, actual,
+                  device) -> tuple[dict[str, object], dict[str, object]]:
+    """Return the unchanged global acceptance metric plus a local-rank metric.
+
+    Unlike ``metric``, this never asserts on a shape or dtype mismatch.  That
+    lets the full-scale case persist every rank's evidence before raising.
+    """
+
+    reference_shape = list(reference.shape)
+    actual_shape = list(actual.shape)
+    reference_dtype = str(reference.dtype)
+    actual_dtype = str(actual.dtype)
+    shape_match = reference_shape == actual_shape
+    dtype_match = reference_dtype == actual_dtype
+    reference_finite = bool(torch.isfinite(reference).all().item())
+    actual_finite = bool(torch.isfinite(actual).all().item())
+    shapes_match_everywhere = all_ranks_true(shape_match, device)
+    dtypes_match_everywhere = all_ranks_true(dtype_match, device)
+    atol, rtol = BF16_TOLERANCE
+
+    local_mean = local_maximum = local_relative = None
+    global_mean = global_maximum = global_relative = None
+    global_finite = False
+    if shapes_match_everywhere:
+        reference_float = reference.float()
+        actual_float = actual.float()
+        difference = (reference_float - actual_float).abs()
+        local_sum = difference.sum()
+        local_count = torch.tensor(
+            difference.numel(), dtype=torch.float64, device=device
+        )
+        local_max = difference.max()
+        local_reference_sum = reference_float.abs().sum()
+        local_mean = float((local_sum / local_count).item())
+        local_maximum = float(local_max.item())
+        local_relative = float((local_sum / local_reference_sum).item())
+
+        global_sum = local_sum.clone()
+        global_count = local_count.clone()
+        global_max = local_max.clone()
+        global_reference_sum = local_reference_sum.clone()
+        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_reference_sum, op=dist.ReduceOp.SUM)
+        global_mean = float((global_sum / global_count).item())
+        global_maximum = float(global_max.item())
+        global_relative = float((global_sum / global_reference_sum).item())
+        global_finite = all_ranks_true(
+            reference_finite
+            and actual_finite
+            and all(math.isfinite(value) for value in (
+                local_mean, local_maximum, local_relative,
+            )),
+            device,
+        )
+
+    local_finite = (
+        reference_finite
+        and actual_finite
+        and local_mean is not None
+        and all(math.isfinite(value) for value in (
+            local_mean, local_maximum, local_relative,
+        ))
+    )
+    local_pass = bool(
+        shape_match
+        and dtype_match
+        and local_finite
+        and local_maximum <= atol
+        and local_relative <= rtol
+    )
+    global_pass = bool(
+        shapes_match_everywhere
+        and dtypes_match_everywhere
+        and global_finite
+        and global_maximum <= atol
+        and global_relative <= rtol
+    )
+    local = {
+        "name": name,
+        "category": category,
+        "reference_shape": reference_shape,
+        "actual_shape": actual_shape,
+        "shape_match": shape_match,
+        "reference_dtype": reference_dtype,
+        "actual_dtype": actual_dtype,
+        "dtype_match": dtype_match,
+        "reference_finite": reference_finite,
+        "actual_finite": actual_finite,
+        "finite": local_finite,
+        "abs_error_mean": json_number(local_mean),
+        "max_abs_error": json_number(local_maximum),
+        "relative_l1_error": json_number(local_relative),
+        "atol": atol,
+        "relative_l1_tolerance": rtol,
+        "pass": local_pass,
+    }
+    global_metric = {
+        "name": name,
+        "category": category,
+        "reference_shape": reference_shape,
+        "actual_shape": actual_shape,
+        "shape_match_on_all_ranks": shapes_match_everywhere,
+        "reference_dtype": reference_dtype,
+        "actual_dtype": actual_dtype,
+        "dtype_match_on_all_ranks": dtypes_match_everywhere,
+        "finite_on_all_ranks": global_finite,
+        "abs_error_mean": json_number(global_mean),
+        "abs_error_max": json_number(global_maximum),
+        "relative_l1_error": json_number(global_relative),
+        "atol": atol,
+        "relative_l1_tolerance": rtol,
+        "pass": global_pass,
+    }
+    return global_metric, local
+
+
+def unavailable_local_metric(name: str, category: str,
+                             reason: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "category": category,
+        "reference_shape": None,
+        "actual_shape": None,
+        "shape_match": False,
+        "reference_dtype": None,
+        "actual_dtype": None,
+        "dtype_match": False,
+        "reference_finite": False,
+        "actual_finite": False,
+        "finite": False,
+        "abs_error_mean": None,
+        "max_abs_error": None,
+        "relative_l1_error": None,
+        "atol": BF16_TOLERANCE[0],
+        "relative_l1_tolerance": BF16_TOLERANCE[1],
+        "pass": False,
+        "unavailable_reason": reason,
+    }
+
+
 def routed_rows(schedule, device) -> list[int]:
     if type(schedule.num_tokens_host) is not int:
         raise AssertionError("cached CuTe schedule lacks num_tokens_host")
@@ -171,6 +332,132 @@ def checked_forward(config, workspace, schedule, inputs, local_rank: int):
     output, context = forward(config, workspace, schedule, inputs)
     torch.cuda.synchronize(workspace.device)
     return output, context
+
+
+def checked_forward_with_abi(config, workspace, schedule, inputs,
+                             local_rank: int):
+    """Run ``functional.forward`` while retaining its raw nine-tensor ABI."""
+
+    captured: list[tuple[object, ...]] = []
+    if config.fwd_backend == "cuda":
+        owner = functional
+        attribute = "dispatch_mlp_swiglu_combine_fwd_bf16"
+    else:
+        import importlib
+
+        owner = importlib.import_module("mok.cutedsl.forward")
+        attribute = "forward_bf16"
+    original = getattr(owner, attribute)
+
+    def capture(*args, **kwargs):
+        tensors = original(*args, **kwargs)
+        captured.append(tuple(tensors))
+        return tensors
+
+    workspace.combine_buffer.fill_(float("nan"))
+    dist.barrier(device_ids=[local_rank])
+    setattr(owner, attribute, capture)
+    try:
+        output, context = forward(config, workspace, schedule, inputs)
+    finally:
+        setattr(owner, attribute, original)
+    torch.cuda.synchronize(workspace.device)
+    raw_abi = captured[0] if len(captured) == 1 else ()
+    return output, context, raw_abi
+
+
+def local_schedule_diagnostic(schedule, rank: int) -> dict[str, object]:
+    host_tokens = schedule.num_tokens_host
+    num_tokens = (
+        host_tokens if type(host_tokens) is int else int(schedule.num_tokens.item())
+    )
+    valid_tokens = int(
+        schedule.peer_rank[:num_tokens].ge(0).sum(dtype=torch.int64).item()
+    )
+    return {
+        "rank": rank,
+        "num_tokens": num_tokens,
+        "num_tokens_kind": "scheduler_padded_routed_rows",
+        "non_padding_tokens": valid_tokens,
+        "padding": num_tokens - valid_tokens,
+        "generations": (num_tokens + MACROBATCH - 1) // MACROBATCH,
+        "macrobatch": MACROBATCH,
+        "schedule_capacity": int(schedule.peer_rank.numel()),
+    }
+
+
+def diagnostic_path() -> Path:
+    explicit = os.environ.get("MOK_QWEN_FWD_PARITY_DIAGNOSTIC_JSON")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    result = os.environ.get("MOK_QWEN_FWD_AB_JSON")
+    if result:
+        result_path = Path(result).expanduser().resolve()
+        suffix = result_path.suffix or ".json"
+        return result_path.with_name(
+            f"{result_path.stem}.full-parity-failure{suffix}"
+        )
+    return (Path.cwd() / "qwen_fwd_full_parity_failure.json").resolve()
+
+
+def atomic_write_json_fsync(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, allow_nan=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def persist_full_scale_failure(local_diagnostic: dict[str, object]) -> str:
+    gathered: list[dict[str, object] | None] = [
+        None for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather_object(gathered, local_diagnostic)
+    rank = dist.get_rank()
+    outcome: list[dict[str, str] | None] = [None]
+    if rank == 0:
+        path = diagnostic_path()
+        payload = {
+            "status": "FAIL",
+            "case": "T=102400 BF16 CUDA-vs-CuTe full parity",
+            "tokens_per_rank": TIMING_TOKENS,
+            "macrobatch": MACROBATCH,
+            "minibatch": MINIBATCH,
+            "expected_generations": 32,
+            "acceptance_tensors": list(RESULT_NAMES),
+            "forward_context_tensors_diagnostic_only": list(
+                FORWARD_CONTEXT_NAMES
+            ),
+            "rank_diagnostics": gathered,
+            "timing_started": False,
+        }
+        try:
+            atomic_write_json_fsync(path, payload)
+            outcome[0] = {"path": str(path)}
+            print(json.dumps({
+                "full_parity_diagnostic": str(path), "status": "WRITTEN",
+            }, sort_keys=True), flush=True)
+        except Exception as error:  # synchronize the persistence error to all ranks
+            outcome[0] = {"error": f"{type(error).__name__}: {error}"}
+    dist.broadcast_object_list(outcome, src=0)
+    if outcome[0] is None or "error" in outcome[0]:
+        detail = "missing rank-0 outcome" if outcome[0] is None else outcome[0]["error"]
+        raise RuntimeError(f"failed to persist full parity diagnostic: {detail}")
+    return outcome[0]["path"]
 
 
 def correctness_case(tokens: int, expected_generations: int, rank: int,
@@ -232,42 +519,132 @@ def full_scale_parity_case(inputs, workspace, schedule, local_rank: int,
     cuda_config = make_config(MACROBATCH, MINIBATCH, 40, "cuda")
     cute_config = make_config(MACROBATCH, MINIBATCH, 40, "cutedsl")
     with torch.no_grad():
-        cuda_output, cuda_context = checked_forward(
+        cuda_output, cuda_context, cuda_forward_abi = checked_forward_with_abi(
             cuda_config, workspace, schedule, inputs, local_rank
         )
+        cute_output, cute_context, cute_forward_abi = checked_forward_with_abi(
+            cute_config, workspace, schedule, inputs, local_rank
+        )
+
+        output_comparison, local_output = parity_metric(
+            "cutedsl_vs_cuda/output", "forward_output",
+            cuda_output, cute_output, device,
+        )
+        cuda_abi_count = len(cuda_forward_abi)
+        cute_abi_count = len(cute_forward_abi)
+        local_abi_ok = (
+            cuda_abi_count == len(FORWARD_CONTEXT_NAMES)
+            and cute_abi_count == len(FORWARD_CONTEXT_NAMES)
+        )
+        abi_ok = all_ranks_true(local_abi_ok, device)
+        forward_context_comparisons = []
+        local_forward_contexts = []
+        if abi_ok:
+            for name, expected, actual in zip(
+                FORWARD_CONTEXT_NAMES,
+                cuda_forward_abi,
+                cute_forward_abi,
+                strict=True,
+            ):
+                comparison, local = parity_metric(
+                    f"cutedsl_vs_cuda/{name}",
+                    "forward_context_diagnostic_only",
+                    expected,
+                    actual,
+                    device,
+                )
+                forward_context_comparisons.append(comparison)
+                local_forward_contexts.append(local)
+        else:
+            local_forward_contexts = [
+                unavailable_local_metric(
+                    f"cutedsl_vs_cuda/{name}",
+                    "forward_context_diagnostic_only",
+                    "raw forward ABI did not contain exactly nine tensors",
+                )
+                for name in FORWARD_CONTEXT_NAMES
+            ]
+
+        # Backward replay mutates routed context ring buffers.  Their CUDA-vs-
+        # CuTe diagnostic above must therefore finish before either BWD starts.
+        cuda_forward_abi = cute_forward_abi = None
         cuda_gradients = backward(
             cuda_config, workspace, schedule, cuda_context, inputs
         )
         torch.cuda.synchronize(device)
-        cuda_context = None
-
-        cute_output, cute_context = checked_forward(
-            cute_config, workspace, schedule, inputs, local_rank
-        )
         cute_gradients = backward(
             cute_config, workspace, schedule, cute_context, inputs
         )
         torch.cuda.synchronize(device)
-        cute_context = None
 
-    comparisons = [
-        metric(f"cutedsl_vs_cuda/{name}", expected, actual)
+    gradient_count_ok = all_ranks_true(
+        len(cuda_gradients) == len(RESULT_NAMES) - 1
+        and len(cute_gradients) == len(RESULT_NAMES) - 1,
+        device,
+    )
+    gradient_comparisons = []
+    local_gradients = []
+    if gradient_count_ok:
         for name, expected, actual in zip(
-            RESULT_NAMES,
-            (cuda_output, *cuda_gradients),
-            (cute_output, *cute_gradients),
-            strict=True,
-        )
-    ]
-    rows = routed_rows(schedule, device)
-    generations = [(value + MACROBATCH - 1) // MACROBATCH for value in rows]
-    generation_pass = all(value == 32 for value in generations)
+            RESULT_NAMES[1:], cuda_gradients, cute_gradients, strict=True
+        ):
+            comparison, local = parity_metric(
+                f"cutedsl_vs_cuda/{name}", "backward_gradient",
+                expected, actual, device,
+            )
+            gradient_comparisons.append(comparison)
+            local_gradients.append(local)
+    else:
+        local_gradients = [
+            unavailable_local_metric(
+                f"cutedsl_vs_cuda/{name}",
+                "backward_gradient",
+                "backward did not return exactly eight gradients",
+            )
+            for name in RESULT_NAMES[1:]
+        ]
+    comparisons = [output_comparison, *gradient_comparisons]
+    rank = dist.get_rank()
+    schedule_diagnostic = local_schedule_diagnostic(schedule, rank)
+    generation_pass = schedule_diagnostic["generations"] == 32
     passed = all_ranks_true(
-        generation_pass and all(bool(item["pass"]) for item in comparisons),
+        generation_pass
+        and gradient_count_ok
+        and all(bool(item["pass"]) for item in comparisons),
         device,
     )
     if not passed:
-        raise AssertionError("T=102400 BF16 CUDA-vs-CuTe parity failed")
+        diagnostic = {
+            "rank": rank,
+            "schedule": schedule_diagnostic,
+            "forward": {
+                "output": local_output,
+                "contexts": {
+                    "diagnostic_only": True,
+                    "affects_acceptance": False,
+                    "cuda_abi_tensor_count": cuda_abi_count,
+                    "cutedsl_abi_tensor_count": cute_abi_count,
+                    "comparisons": local_forward_contexts,
+                },
+            },
+            "backward": {"gradients": local_gradients},
+            "acceptance": {
+                "generation_pass": generation_pass,
+                "output_and_eight_gradients_pass": all(
+                    bool(item["pass"]) for item in comparisons
+                ) and gradient_count_ok,
+                "cuda_gradient_tensor_count": len(cuda_gradients),
+                "cutedsl_gradient_tensor_count": len(cute_gradients),
+                "pass": False,
+            },
+        }
+        path = persist_full_scale_failure(diagnostic)
+        raise AssertionError(
+            "T=102400 BF16 CUDA-vs-CuTe parity failed; "
+            f"diagnostic={path}"
+        )
+    rows = routed_rows(schedule, device)
+    generations = [(value + MACROBATCH - 1) // MACROBATCH for value in rows]
     return {
         "tokens_per_rank": TIMING_TOKENS,
         "reference": "trusted CUDA backend at the same source revision",
@@ -278,6 +655,16 @@ def full_scale_parity_case(inputs, workspace, schedule, local_rank: int,
         "generations_by_rank": generations,
         "expected_generations": 32,
         "comparisons": comparisons,
+        "forward_context_diagnostic_only": {
+            "affects_acceptance": False,
+            "captured_nine_tensor_abi_on_all_ranks": abi_ok,
+            "comparisons": forward_context_comparisons,
+            "pass": (
+                abi_ok
+                and all(bool(item["pass"])
+                        for item in forward_context_comparisons)
+            ),
+        },
         "pass": passed,
     }
 
