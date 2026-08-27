@@ -245,9 +245,14 @@ def _gated_swiglu(
     outputs: dict[str, torch.Tensor],
     cu_seqlens_m: torch.Tensor | None,
 ) -> None:
+    # QuACK's concat-layout contract consumes the packed physical B as
+    # [..., N, K].  Its v0.6.4 canonical frontend deliberately disables the
+    # alternative KxN (`b_kn`) path whenever concat layout is active.
+    # Passing the transposed view plus b_kn=True reaches a low-level validation
+    # hole and is not a supported layout combination.
     epilogue.gemm(
         activations,
-        packed_weights_e2ik.transpose(-2, -1),
+        packed_weights_e2ik,
         None,
         epi_args=outputs,
         tile_M=GATED_TILE_M,
@@ -259,7 +264,6 @@ def _gated_swiglu(
         is_dynamic_persistent=True,
         max_swizzle_size=GATED_MAX_SWIZZLE,
         cu_seqlens_m=cu_seqlens_m,
-        b_kn=True,
         concat_layout=("B",),
     )
 

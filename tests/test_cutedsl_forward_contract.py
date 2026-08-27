@@ -125,7 +125,6 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
             ".to(BFloat16).to(Float32)",
             "epilogue.gemm(",
             "epi_args=outputs",
-            "b_kn=True",
             'concat_layout=("B",)',
             "is_dynamic_persistent=True",
             "GATED_CLUSTER_M = 1",
@@ -139,6 +138,8 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
         ):
             self.assertIn(snippet, _QUACK_SOURCE)
         self.assertEqual(_QUACK_SOURCE.count("torch.cat("), 1)
+        self.assertNotIn("\n        b_kn=True,", _QUACK_SOURCE)
+        self.assertNotIn("\n        packed_weights_e2ik.transpose", _QUACK_SOURCE)
         self.assertNotIn("torch.cat(", _FORWARD_SOURCE)
         self.assertEqual(
             _FORWARD_SOURCE.count("packed_routed_gate_up_weights("),
