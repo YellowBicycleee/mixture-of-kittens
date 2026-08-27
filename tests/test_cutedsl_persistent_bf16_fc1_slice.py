@@ -4,7 +4,9 @@ import ast
 import importlib.util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +79,85 @@ class TestPersistentBf16Fc1Slice(unittest.TestCase):
         self.assertNotIn("mok.cutedsl.forward", imports)
         self.assertNotIn("run_comm_cta", _GEMM_SOURCE)
         self.assertIn('cute.compile(_FC1_SLICE, *cute_args)', _GEMM_SOURCE)
+
+    def test_run_compiles_then_calls_executor_with_identical_args(self) -> None:
+        tree = ast.parse(_GEMM_SOURCE)
+        run = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_fc1_slice"
+        )
+        calls = [node for node in ast.walk(run) if isinstance(node, ast.Call)]
+        compile_call = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "cute"
+            and call.func.attr == "compile"
+        )
+        execute_call = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Name) and call.func.id == "executor"
+        )
+        for call in (compile_call, execute_call):
+            starred = [arg for arg in call.args if isinstance(arg, ast.Starred)]
+            self.assertEqual(len(starred), 1)
+            self.assertEqual(starred[0].value.id, "cute_args")
+        self.assertEqual(
+            sum(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "executor"
+                for node in ast.walk(run)
+            ),
+            1,
+        )
+
+    def test_compile_and_run_share_one_argument_builder(self) -> None:
+        tree = ast.parse(_GEMM_SOURCE)
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for name in ("compile_fc1_slice", "run_fc1_slice"):
+            helper_calls = [
+                node
+                for node in ast.walk(functions[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_make_fc1_slice_args"
+            ]
+            self.assertEqual(len(helper_calls), 1)
+
+    def test_run_rejects_bad_host_tensors_before_cuda_gate(self) -> None:
+        capability = mock.Mock(return_value=(10, 3))
+        fake_torch = SimpleNamespace(
+            Tensor=type("FakeTensor", (), {}),
+            bfloat16=object(),
+            cuda=SimpleNamespace(get_device_capability=capability),
+        )
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            with self.assertRaisesRegex(TypeError, "x must be a torch.Tensor"):
+                _HOST.run_fc1_slice(object(), object(), object(), object())
+        capability.assert_not_called()
+
+    def test_run_rejects_non_sm103_before_importing_device_body(self) -> None:
+        x = SimpleNamespace(device="cuda:0")
+        capability = mock.Mock(return_value=(9, 0))
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(get_device_capability=capability)
+        )
+        with (
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(_HOST, "validate_fc1_slice_tensors") as validate,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "B300/SM103"):
+                _HOST.run_fc1_slice(x, object(), object(), object())
+        validate.assert_called_once()
+        capability.assert_called_once_with("cuda:0")
 
     def test_exact_dependency_versions_are_visible(self) -> None:
         self.assertIn('_REQUIRED_CUTLASS_DSL = "4.6.2"', _GEMM_SOURCE)

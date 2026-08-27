@@ -102,6 +102,23 @@ def validate_fc1_slice_tensors(x, gate, up, packed_output) -> None:
             raise ValueError(f"{name} must have shape {shape}; got {tuple(tensor.shape)}")
 
 
+def _validate_fc1_slice_call(
+    x,
+    gate,
+    up,
+    packed_output,
+    plan: Fc1SlicePlan,
+) -> None:
+    """Apply the shared fail-closed host gate before importing CuTe DSL."""
+
+    import torch
+
+    plan.validate()
+    validate_fc1_slice_tensors(x, gate, up, packed_output)
+    if torch.cuda.get_device_capability(x.device) != (10, 3):
+        raise NotImplementedError("the BF16 FC1 slice requires B300/SM103")
+
+
 def compile_fc1_slice(
     x,
     gate,
@@ -118,16 +135,33 @@ def compile_fc1_slice(
     dependencies is an explicit error, never a fallback.
     """
 
-    import torch
-
-    plan.validate()
-    validate_fc1_slice_tensors(x, gate, up, packed_output)
-    if torch.cuda.get_device_capability(x.device) != (10, 3):
-        raise NotImplementedError("the BF16 FC1 slice requires B300/SM103")
+    _validate_fc1_slice_call(x, gate, up, packed_output, plan)
 
     from ._persistent_bf16_gemm import compile_fc1_slice as _compile
 
     return _compile(x, gate, up, packed_output, stream=stream)
+
+
+def run_fc1_slice(
+    x,
+    gate,
+    up,
+    packed_output,
+    *,
+    stream=None,
+    plan: Fc1SlicePlan = Fc1SlicePlan(),
+) -> None:
+    """Compile and launch the private raw Gate/Up slice exactly once.
+
+    The caller owns ``packed_output`` and stream synchronization.  This probe
+    is not connected to the public Forward backend and has no fallback.
+    """
+
+    _validate_fc1_slice_call(x, gate, up, packed_output, plan)
+
+    from ._persistent_bf16_gemm import run_fc1_slice as _run
+
+    _run(x, gate, up, packed_output, stream=stream)
 
 
 __all__ = [
@@ -140,5 +174,6 @@ __all__ = [
     "FULL_PERSISTENT_FORWARD_COMPLETE",
     "Fc1SlicePlan",
     "compile_fc1_slice",
+    "run_fc1_slice",
     "validate_fc1_slice_tensors",
 ]

@@ -506,22 +506,36 @@ class _Fc1Slice:
 _FC1_SLICE = _Fc1Slice()
 
 
-def compile_fc1_slice(x, gate, up, packed_output, *, stream=None):
-    """Compile the exact four-tensor specialization and return its executor."""
+def _make_fc1_slice_args(x, gate, up, packed_output, stream):
+    """Convert one validated host call to its complete CuTe argument tuple."""
 
     import torch
 
     if stream is None:
         stream = torch.cuda.current_stream(x.device)
     cuda_stream = cuda.CUstream(stream.cuda_stream)
-    cute_args = (
+    return (
         from_dlpack(x, assumed_align=16),
         from_dlpack(gate, assumed_align=16),
         from_dlpack(up, assumed_align=16),
         from_dlpack(packed_output, assumed_align=16),
         cuda_stream,
     )
+
+
+def compile_fc1_slice(x, gate, up, packed_output, *, stream=None):
+    """Compile the exact four-tensor specialization and return its executor."""
+
+    cute_args = _make_fc1_slice_args(x, gate, up, packed_output, stream)
     return cute.compile(_FC1_SLICE, *cute_args)
 
 
-__all__ = ["compile_fc1_slice"]
+def run_fc1_slice(x, gate, up, packed_output, *, stream=None) -> None:
+    """Compile and execute the exact specialization once with identical args."""
+
+    cute_args = _make_fc1_slice_args(x, gate, up, packed_output, stream)
+    executor = cute.compile(_FC1_SLICE, *cute_args)
+    executor(*cute_args)
+
+
+__all__ = ["compile_fc1_slice", "run_fc1_slice"]
