@@ -237,7 +237,7 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
 
 // Private parallel EP8 BF16 forward.  It deliberately bypasses the legacy
 // environment selector so the legacy forward ABI and specializations remain
-// unchanged while Union-X is compiled as exactly CLC1/G1/D1.
+// unchanged while this child compiles Union-X as exactly CLC2/G1/D1.
 static __host__ std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -264,7 +264,7 @@ dispatch_mlp_swiglu_combine_fwd_bf16_union_x_entrypoint(
     int minibatch_size
 ) {
     using union_x_impl = dispatch_mlp_swiglu_combiner<
-        8, RoutedPrecision::BF16, 1, 1, 1>;
+        8, RoutedPrecision::BF16, 2, 1, 1>;
     return union_x_impl::dispatch_mlp_swiglu_combine_fwd_bf16_union_x(
         x,
         x_ptrs,

@@ -91,7 +91,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
 ) {
     static_assert(NUM_DEVICES == 8);
     static_assert(!USE_MXFP8);
-    static_assert(FWD_CLC_PIPE_DEPTH == 1);
+    static_assert(FWD_CLC_PIPE_DEPTH == 2);
     static_assert(FWD_GATE_GROUP_SIZE == 1);
     static_assert(FWD_DOWN_GROUP_SIZE == 1);
     // The EP8 BF16 forward selector may keep two CLC result slots so the
@@ -478,7 +478,7 @@ dispatch_mlp_swiglu_combine_fwd_bf16_union_x(
 ) {
     static_assert(NUM_DEVICES == 8);
     static_assert(!USE_MXFP8);
-    static_assert(FWD_CLC_PIPE_DEPTH == 1);
+    static_assert(FWD_CLC_PIPE_DEPTH == 2);
     static_assert(FWD_GATE_GROUP_SIZE == 1);
     static_assert(FWD_DOWN_GROUP_SIZE == 1);
 

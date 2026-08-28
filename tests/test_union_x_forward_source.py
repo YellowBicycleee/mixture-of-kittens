@@ -24,11 +24,11 @@ class UnionXForwardSourceContractTest(unittest.TestCase):
         self.assertIn("struct globals_union_x_fwd", FORWARD)
         self.assertIn("static_assert(NUM_DEVICES == 8);", FORWARD)
         self.assertIn("static_assert(!USE_MXFP8);", FORWARD)
-        self.assertIn("static_assert(FWD_CLC_PIPE_DEPTH == 1);", FORWARD)
+        self.assertIn("static_assert(FWD_CLC_PIPE_DEPTH == 2);", FORWARD)
         self.assertIn("static_assert(FWD_GATE_GROUP_SIZE == 1);", FORWARD)
         self.assertIn("static_assert(FWD_DOWN_GROUP_SIZE == 1);", FORWARD)
         self.assertIn(
-            "8, RoutedPrecision::BF16, 1, 1, 1", ENTRYPOINTS
+            "8, RoutedPrecision::BF16, 2, 1, 1", ENTRYPOINTS
         )
         self.assertNotIn("union_x", LEGACY_FORWARD)
 
