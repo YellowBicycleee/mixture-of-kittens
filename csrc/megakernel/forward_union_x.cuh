@@ -85,6 +85,12 @@ struct globals_union_x_fwd {
     }
 };
 
+// Keep Dispatch/readiness at the configured minibatch granularity, but order
+// routed compute in stage-major windows of up to 16K rows.  This preserves all
+// task identities and dependency counts while avoiding a Gate/Down role switch
+// after every 4K communication minibatch.
+static constexpr int UNION_X_COMPUTE_GROUP_ROWS = 16384;
+
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_kernel(
     const globals_union_x_fwd &g
@@ -130,6 +136,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
     const int num_tokens = g.num_tokens[{0}];
     const int num_macrobatches = (num_tokens + macrobatch_size - 1) / macrobatch_size;
     const int minibatches_per_macrobatch = macrobatch_size / g.minibatch_size;
+    const int compute_minibatches_per_group =
+        UNION_X_COMPUTE_GROUP_ROWS % g.minibatch_size == 0
+        ? min(
+            minibatches_per_macrobatch,
+            max(1, UNION_X_COMPUTE_GROUP_ROWS / g.minibatch_size))
+        : 1;
     const int true_num_global_minibatches = (num_tokens + g.minibatch_size - 1) / g.minibatch_size;
     const int last_macrobatch_num_minibatches = true_num_global_minibatches - (num_macrobatches - 1) * minibatches_per_macrobatch;
     const int true_num_clusters = comm_clusters + shared_tasks + true_num_global_minibatches * minibatch_tasks;
@@ -334,19 +346,76 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
             }
         } else {
             // Routed expert with macro/minibatching
-            const int task_ordered_global_minibatch_idx = (compute_cluster_idx - shared_tasks) / minibatch_tasks;
-            const int minibatch_task_idx = (compute_cluster_idx - shared_tasks) - task_ordered_global_minibatch_idx * minibatch_tasks;
-            int macrobatch_idx, minibatch_idx;
-            if (task_ordered_global_minibatch_idx < last_macrobatch_num_minibatches) {
+            const int routed_task_order = compute_cluster_idx - shared_tasks;
+            const int last_macrobatch_tasks =
+                last_macrobatch_num_minibatches * minibatch_tasks;
+            const int full_macrobatch_tasks =
+                minibatches_per_macrobatch * minibatch_tasks;
+            int macrobatch_idx;
+            int macrobatch_num_minibatches;
+            int macrobatch_task_order;
+            if (routed_task_order < last_macrobatch_tasks) {
                 macrobatch_idx = num_macrobatches - 1;
-                minibatch_idx = task_ordered_global_minibatch_idx;
+                macrobatch_num_minibatches =
+                    last_macrobatch_num_minibatches;
+                macrobatch_task_order = routed_task_order;
             } else {
-                const int idx = task_ordered_global_minibatch_idx - last_macrobatch_num_minibatches;
-                macrobatch_idx = num_macrobatches - 2 - idx / minibatches_per_macrobatch;
-                minibatch_idx = idx % minibatches_per_macrobatch;
+                const int full_macrobatch_task_order =
+                    routed_task_order - last_macrobatch_tasks;
+                macrobatch_idx = num_macrobatches - 2
+                    - full_macrobatch_task_order / full_macrobatch_tasks;
+                macrobatch_num_minibatches = minibatches_per_macrobatch;
+                macrobatch_task_order =
+                    full_macrobatch_task_order % full_macrobatch_tasks;
             }
 
-            if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
+            const int full_group_tasks =
+                compute_minibatches_per_group * minibatch_tasks;
+            const int num_full_groups =
+                macrobatch_num_minibatches / compute_minibatches_per_group;
+            const int full_groups_tasks =
+                num_full_groups * full_group_tasks;
+            int group_minibatch_start;
+            int group_num_minibatches;
+            int group_task_order;
+            if (macrobatch_task_order < full_groups_tasks) {
+                const int group_idx =
+                    macrobatch_task_order / full_group_tasks;
+                group_minibatch_start =
+                    group_idx * compute_minibatches_per_group;
+                group_num_minibatches = compute_minibatches_per_group;
+                group_task_order =
+                    macrobatch_task_order - group_idx * full_group_tasks;
+            } else {
+                group_minibatch_start =
+                    num_full_groups * compute_minibatches_per_group;
+                group_num_minibatches =
+                    macrobatch_num_minibatches - group_minibatch_start;
+                group_task_order =
+                    macrobatch_task_order - full_groups_tasks;
+            }
+
+            const int group_gate_up_tasks =
+                group_num_minibatches * minibatch_routed_gate_up_tasks;
+            const bool is_routed_gate_up =
+                group_task_order < group_gate_up_tasks;
+            int minibatch_idx;
+            int minibatch_task_idx;
+            if (is_routed_gate_up) {
+                minibatch_idx = group_minibatch_start
+                    + group_task_order / minibatch_routed_gate_up_tasks;
+                minibatch_task_idx =
+                    group_task_order % minibatch_routed_gate_up_tasks;
+            } else {
+                const int group_down_task_order =
+                    group_task_order - group_gate_up_tasks;
+                minibatch_idx = group_minibatch_start
+                    + group_down_task_order / minibatch_routed_down_tasks;
+                minibatch_task_idx = minibatch_routed_gate_up_tasks
+                    + group_down_task_order % minibatch_routed_down_tasks;
+            }
+
+            if (is_routed_gate_up) {
                 // Routed Gate + Up + SwiGLU. Only macrobatch 0 retains
                 // preactivations/transpose context; hidden normal is written
                 // for every macrobatch so Down can consume it immediately.
