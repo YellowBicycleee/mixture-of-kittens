@@ -53,7 +53,7 @@ struct globals_union_x_fwd {
             shared_row_blocks * (w_shared_gate.rows() / config::SWIGLU_Nb);
         const int minibatch_routed_gate_up_raw_tasks =
             minibatch_routed_row_blocks
-            * (w_routed_gate.rows() / config::SWIGLU_Nb);
+            * (w_routed_gate.rows() / UNION_X_RGU_PACKED_HIDDEN_N);
         const int shared_gate_up_tasks =
             (shared_gate_up_raw_tasks
                 + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
@@ -102,13 +102,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
-    // A raw fused task computes one MLP_Mb x SWIGLU_Nb hidden tile. CTA 0
-    // supplies Gate weights and CTA 1 supplies Up weights to the same
-    // cooperative MMA. One CLC task executes a small group of raw tiles
-    // serially to reduce scheduler traffic while retaining per-tile stores and
-    // ready arrivals.
+    // Shared raw tasks retain one MLP_Mb x SWIGLU_Nb hidden tile.  Routed
+    // Union-X raw tasks pair two adjacent SWIGLU_Nb tiles so one gathered A
+    // feeds two independent Gate|Up accumulators.  Each old hidden tile keeps
+    // its own store and ready arrival.
     const int shared_gate_up_raw_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::SWIGLU_Nb);
-    const int minibatch_routed_gate_up_raw_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::SWIGLU_Nb);
+    const int minibatch_routed_gate_up_raw_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / UNION_X_RGU_PACKED_HIDDEN_N);
     const int shared_gate_up_tasks =
         (shared_gate_up_raw_tasks + config::FUSED_GATE_UP_TASK_GROUP_SIZE - 1)
         / config::FUSED_GATE_UP_TASK_GROUP_SIZE;
@@ -206,7 +205,13 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
     }
 
     tensor_allocator<1, config::CLUSTER_SIZE> tm_alloc{};
+    static_assert(
+        2 * config::MLP_Nb <= decltype(tm_alloc)::cols,
+        "routed Union-X N512 requires two BF16 accumulator halves");
     tt<float, config::MLP_Mb / 2, config::MLP_Nb> d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(0);
+    // This specialization is BF16-only, so the MXFP8 scale half is unused and
+    // can hold the paired logical-N accumulator, as in paired BF16 Replay.
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> paired_d_tt = tm_alloc.template allocate<tt<float, config::MLP_Mb / 2, config::MLP_Nb>>(256);
     full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH> a_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<16 * config::MLP_LOAD_PIPE_DEPTH>>(256);
     full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH> b_sc_tt = tm_alloc.template allocate<full_tt_fp8e8m0<32 * config::MLP_LOAD_PIPE_DEPTH>>(384);
     everyone::tma::cluster::sync();
@@ -359,6 +364,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_k
                     g.union_x_ready,
                     g.hidden_row_block_ready,
                     d_tt,
+                    paired_d_tt,
                     gemm_inputs_arrived,
                     union_b_inputs_armed,
                     union_a_inputs_reusable,

@@ -126,6 +126,26 @@ class UnionXForwardSourceContractTest(unittest.TestCase):
         self.assertNotIn("g.x_fp8_routed", FORWARD)
         self.assertNotIn("g.gate_up_tile_ready", FORWARD)
 
+    def test_only_routed_gate_up_task_width_is_paired(self):
+        self.assertIn(
+            "w_routed_gate.rows() / UNION_X_RGU_PACKED_HIDDEN_N",
+            FORWARD,
+        )
+        self.assertIn(
+            "w_shared_gate.rows() / config::SWIGLU_Nb", FORWARD
+        )
+        self.assertIn(
+            "g.w_routed_down.rows() / config::MLP_Nb", FORWARD
+        )
+        self.assertIn(
+            "2 * config::MLP_Nb <= decltype(tm_alloc)::cols", FORWARD
+        )
+        self.assertIn("paired_d_tt", FORWARD)
+        # Down still waits for the old per-N128 hidden publication count.
+        self.assertIn(
+            "g.hidden_shared.cols() / config::SWIGLU_Nb", FORWARD
+        )
+
     def test_ring_and_readiness_extents_match_legacy(self):
         for declaration in (
             "at::empty({macrobatch_size, intermediate_dim}, x.options())",

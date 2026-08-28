@@ -9,17 +9,21 @@ SOURCE = HEADER.read_text()
 GATHER = (ROOT / "csrc" / "megakernel" / "union_x_gather.cuh").read_text()
 
 
-def test_routed_bf16_only_signature_and_four_stage_geometry() -> None:
+def test_routed_bf16_only_signature_and_paired_n512_geometry() -> None:
     for token in (
         "template <bool IS_CLAMPED>",
         "expert_gate_up_swiglu_union_x_bf16_kernel",
         "const routed_bf16_gl &union_x",
         "const index_gl &route_to_union",
-        "UNION_X_RGU_STAGES = 4",
+        "UNION_X_RGU_STAGES = 2",
         "UNION_X_RGU_A_WAIT_WARP = 5",
         "UNION_X_RGU_A_TMA_WARP = 6",
         "UNION_X_RGU_B_WARP = 7",
         "UNION_X_RGU_MMA_WARP = 4",
+        "UNION_X_RGU_LOGICAL_N_TILES = 2",
+        "UNION_X_RGU_PACKED_HIDDEN_N",
+        "tt<float, config::MLP_Mb / 2, config::MLP_Nb> &paired_d_tt",
+        "paired_b_smem",
         "static_assert(!USE_MXFP8)",
         "must not pass the legacy X-ring counter",
     ):
@@ -37,7 +41,9 @@ def test_task_decode_matches_legacy_routed_ordering_seams() -> None:
     for token in (
         "global_minibatch_routed_first_row_block",
         "tokens_per_expert[{expert_idx}] / config::MLP_Mb",
+        "gate_b_gmem.rows() / UNION_X_RGU_PACKED_HIDDEN_N",
         "get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>",
+        "row_blocks, paired_col_blocks, task_idx",
         "global_first_row_block + swizzled.x",
         "task_group_idx * config::FUSED_GATE_UP_TASK_GROUP_SIZE",
         "macrobatch_idx * macrobatch_size",
@@ -45,6 +51,44 @@ def test_task_decode_matches_legacy_routed_ordering_seams() -> None:
         "+ cta_rank * UNION_X_RGU_CTA_ROWS",
     ):
         assert token in SOURCE
+
+
+def test_each_stage_gathers_a_once_and_consumes_two_adjacent_b_tiles() -> None:
+    a_branch = SOURCE.index("global_warp == UNION_X_RGU_A_TMA_WARP")
+    b_branch = SOURCE.index("global_warp == UNION_X_RGU_B_WARP", a_branch)
+    a_section = SOURCE[a_branch:b_branch]
+    assert a_section.count("union_x_issue_gather4_a_tile(") == 1
+
+    mma_branch = SOURCE.index("global_warp == UNION_X_RGU_MMA_WARP", b_branch)
+    b_section = SOURCE[b_branch:mma_branch]
+    assert b_section.count("tma::cluster::load_async(") == 2
+    assert "tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES" in b_section
+    assert "tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES + 1" in b_section
+
+    epilogue_branch = SOURCE.index("warpgroup::groupid() == 0", mma_branch)
+    mma_section = SOURCE[mma_branch:epilogue_branch]
+    assert mma_section.count("mm2_ABt(") == 2
+    assert mma_section.count("mma2_ABt(") == 2
+    assert "paired_d_tt" in mma_section
+    # Only the second MMA releases A/B stage storage, after both consumers.
+    first_mm = mma_section.index("mm2_ABt(")
+    second_mm = mma_section.index("mm2_ABt(", first_mm + 1)
+    assert "gemm_inputs_finished[input_stage]" not in mma_section[
+        first_mm:second_mm
+    ]
+    assert "gemm_inputs_finished[input_stage]" in mma_section[second_mm:]
+
+
+def test_epilogue_scratch_stays_above_next_generic_task_input_ring() -> None:
+    for token in (
+        "UNION_X_RGU_SCRATCH_OFFSET",
+        "2 * FUSED_GATE_UP_LOAD_PIPE_DEPTH * sizeof(mlp_bf16_tile)",
+        "<= UNION_X_RGU_SCRATCH_OFFSET",
+        "smem_base_addr + UNION_X_RGU_SCRATCH_OFFSET",
+        "Producer warps can accept the next CLC task",
+    ):
+        assert token in SOURCE
+    assert "scratch_base_addr =\n        smem_base_addr\n        + sizeof(a_smem)" not in SOURCE
 
 
 def test_k4096_pipeline_has_independent_a_and_b_readiness() -> None:
@@ -55,7 +99,8 @@ def test_k4096_pipeline_has_independent_a_and_b_readiness() -> None:
         "a_tma_arrived[input_stage]",
         "warp::tma::cluster::arrive(",
         "tma::cluster::load_async(",
-        "config::CLUSTER_SIZE * sizeof(mlp_bf16_tile)",
+        "* UNION_X_RGU_LOGICAL_N_TILES",
+        "* sizeof(mlp_bf16_tile)",
         "tma::cluster::wait(",
         "a_gather_bitfield",
         "mm2_ABt(",
@@ -154,6 +199,9 @@ def test_dispatch_ready_acquire_is_bridged_to_every_async_gather_issuer() -> Non
 def test_bf16_epilogue_preserves_context_swiglu_and_hidden_ready() -> None:
     for token in (
         "const bool save_context = macrobatch_idx == 0",
+        "logical_n_offset < UNION_X_RGU_LOGICAL_N_TILES",
+        "logical_n_offset == 0 ? d_tt : paired_d_tt",
+        "tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES + logical_n_offset",
         "__float22bfloat162_rn",
         "tma::store_async(\n                    gate_context_gmem",
         "tma::store_async(\n                    up_context_gmem",
@@ -164,6 +212,7 @@ def test_bf16_epilogue_preserves_context_swiglu_and_hidden_ready() -> None:
         "barrier_arrive(\n                hidden_row_block_ready",
         "hidden_row_block_ready_base_index",
         "+ macrobatch_row_block_offset + tile_coord.x",
+        "Preserve one publication for each old N128 hidden subtile",
     ):
         assert token in SOURCE
 

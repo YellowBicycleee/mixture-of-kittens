@@ -2,22 +2,31 @@
 //
 // This header is called only by the parallel EP8 BF16 Union-X entrypoint.  It
 // copies the routed BF16 task decode, tcgen05 mainloop, context/SwiGLU
-// epilogue, and Hidden readiness semantics of the legacy tuned kernel.  The A
+// epilogue, and Hidden readiness semantics of the legacy tuned kernel.  Two
+// adjacent logical N128 tiles for the same (expert, route-row block) are
+// explicit one-task partners: every K64 stage gathers A once, loads both B
+// partners, and updates two independent N256 Gate|Up accumulators.  The A
 // operand is reconstructed with SM100 gather4: producer WG local warp 2 issues
 // CTA-local A TMA, local warp 1 publishes its completion to CTA0, and local
 // warp 3 retains the existing routed-weight TMA path.
 
-static constexpr int UNION_X_RGU_STAGES = 4;
+// A stage now owns A + B0 + B1.  Two stages plus the unchanged three BF16
+// epilogue tiles fit the launch SMEM envelope; three such stages do not.
+static constexpr int UNION_X_RGU_STAGES = 2;
 static constexpr int UNION_X_RGU_A_WAIT_WARP = 5;
 static constexpr int UNION_X_RGU_A_TMA_WARP = 6;
 static constexpr int UNION_X_RGU_B_WARP = 7;
 static constexpr int UNION_X_RGU_MMA_WARP = 4;
 static constexpr int UNION_X_RGU_CTA_ROWS = 128;
 static constexpr int UNION_X_RGU_K = 64;
+static constexpr int UNION_X_RGU_LOGICAL_N_TILES = 2;
+static constexpr int UNION_X_RGU_PACKED_HIDDEN_N =
+    UNION_X_RGU_LOGICAL_N_TILES * config::SWIGLU_Nb;
 
 static_assert(UNION_X_RGU_STAGES <= config::MLP_LOAD_PIPE_DEPTH);
 static_assert(UNION_X_RGU_CTA_ROWS == mlp_bf16_tile::rows);
 static_assert(UNION_X_RGU_K == mlp_bf16_tile::cols);
+static_assert(UNION_X_RGU_PACKED_HIDDEN_N == config::MLP_Nb);
 static_assert(config::CLUSTER_SIZE == 2);
 static_assert(config::NUM_THREADS == 256);
 
@@ -38,6 +47,7 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
     const index_gl &input_minibatch_ready,
     const index_gl &hidden_row_block_ready,
     tt<float, config::MLP_Mb / 2, config::MLP_Nb> &d_tt,
+    tt<float, config::MLP_Mb / 2, config::MLP_Nb> &paired_d_tt,
     semaphore (&b_inputs_arrived)[config::MLP_LOAD_PIPE_DEPTH],
     semaphore (&b_inputs_armed)[UNION_X_RGU_STAGES],
     semaphore (&a_inputs_reusable)[UNION_X_RGU_STAGES],
@@ -70,8 +80,20 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
     auto (&b_smem)[UNION_X_RGU_STAGES] = *reinterpret_cast<
         mlp_bf16_tile (*)[UNION_X_RGU_STAGES]>(
             smem_base_addr + sizeof(a_smem));
+    auto (&paired_b_smem)[UNION_X_RGU_STAGES] = *reinterpret_cast<
+        mlp_bf16_tile (*)[UNION_X_RGU_STAGES]>(
+            smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
+    // Producer warps can accept the next CLC task while this task's consumer
+    // still uses its epilogue scratch.  Shared Gate/Up and routed Down both use
+    // a four-stage generic A+B ring, so keep scratch above that 128 KiB region
+    // even though this paired task's compact A+B0+B1 ring needs only 96 KiB.
+    static constexpr uint64_t UNION_X_RGU_SCRATCH_OFFSET =
+        2 * FUSED_GATE_UP_LOAD_PIPE_DEPTH * sizeof(mlp_bf16_tile);
+    static_assert(
+        sizeof(a_smem) + sizeof(b_smem) + sizeof(paired_b_smem)
+        <= UNION_X_RGU_SCRATCH_OFFSET);
     const uint64_t scratch_base_addr =
-        smem_base_addr + sizeof(a_smem) + sizeof(b_smem);
+        smem_base_addr + UNION_X_RGU_SCRATCH_OFFSET;
     auto &gate_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
         scratch_base_addr);
     auto &up_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
@@ -79,11 +101,12 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
     auto &hidden_raw_smem = *reinterpret_cast<quant_bf16_tile *>(
         scratch_base_addr + 2 * sizeof(quant_bf16_tile));
     static_assert(
-        sizeof(a_smem) + sizeof(b_smem)
+        UNION_X_RGU_SCRATCH_OFFSET
             + 3 * sizeof(quant_bf16_tile) + 1023
         <= config::DYNAMIC_SHARED_MEMORY);
 
-    const int col_blocks = gate_b_gmem.rows() / config::SWIGLU_Nb;
+    const int paired_col_blocks =
+        gate_b_gmem.rows() / UNION_X_RGU_PACKED_HIDDEN_N;
     const int global_minibatch_idx =
         macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset =
@@ -118,11 +141,11 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
                     + minibatch_routed_row_blocks,
                 global_row_block_offset + expert_row_blocks)
                 - global_first_row_block);
-        const int num_tasks = row_blocks * col_blocks;
+        const int num_tasks = row_blocks * paired_col_blocks;
         if (task_idx < num_tasks) {
             const int2 swizzled =
                 get_swizzled_2d_idx<config::MLP_SUPERGROUP_SIZE>(
-                    row_blocks, col_blocks, task_idx);
+                    row_blocks, paired_col_blocks, task_idx);
             tile_coord = {
                 global_first_row_block + swizzled.x
                     - macrobatch_row_block_offset,
@@ -228,7 +251,22 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
             tma::cluster::load_async(
                 b_smem[input_stage],
                 weight,
-                {tile_coord.z, tile_coord.y, k_block},
+                {
+                    tile_coord.z,
+                    tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES,
+                    k_block,
+                },
+                b_inputs_arrived[input_stage],
+                static_cast<uint16_t>(1 << cta_rank),
+                0);
+            tma::cluster::load_async(
+                paired_b_smem[input_stage],
+                weight,
+                {
+                    tile_coord.z,
+                    tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES + 1,
+                    k_block,
+                },
                 b_inputs_arrived[input_stage],
                 static_cast<uint16_t>(1 << cta_rank),
                 0);
@@ -250,7 +288,9 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
         for (int k_block = 0; k_block < iters_per_task; ++k_block) {
             tma::expect_bytes(
                 b_inputs_arrived[input_stage],
-                config::CLUSTER_SIZE * sizeof(mlp_bf16_tile));
+                config::CLUSTER_SIZE
+                    * UNION_X_RGU_LOGICAL_N_TILES
+                    * sizeof(mlp_bf16_tile));
             // Publish the arm to the local B warp in both CTAs only after
             // expect_bytes has established this stage's transaction phase.
             warp::tma::cluster::arrive(
@@ -268,13 +308,21 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
                 mm2_ABt(
                     d_tt,
                     a_smem[input_stage],
-                    b_smem[input_stage],
+                    b_smem[input_stage]);
+                mm2_ABt(
+                    paired_d_tt,
+                    a_smem[input_stage],
+                    paired_b_smem[input_stage],
                     gemm_inputs_finished[input_stage]);
             } else {
                 mma2_ABt(
                     d_tt,
                     a_smem[input_stage],
-                    b_smem[input_stage],
+                    b_smem[input_stage]);
+                mma2_ABt(
+                    paired_d_tt,
+                    a_smem[input_stage],
+                    paired_b_smem[input_stage],
                     gemm_inputs_finished[input_stage]);
             }
             update_phasebit<0>(gemm_bitfield, input_stage);
@@ -294,6 +342,13 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
         const bool save_context = macrobatch_idx == 0;
         const int output_row =
             tile_coord.x * config::CLUSTER_SIZE + cta_rank;
+        #pragma unroll 1
+        for (int logical_n_offset = 0;
+             logical_n_offset < UNION_X_RGU_LOGICAL_N_TILES;
+             ++logical_n_offset) {
+        auto &output_tt = logical_n_offset == 0 ? d_tt : paired_d_tt;
+        const int logical_col =
+            tile_coord.y * UNION_X_RGU_LOGICAL_N_TILES + logical_n_offset;
         #pragma unroll 1
         for (int block = 0; block < config::MLP_Nb / 32; ++block) {
             float2 tmp[16];
@@ -320,7 +375,7 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
                   "=f"(tmp[13].x), "=f"(tmp[13].y),
                   "=f"(tmp[14].x), "=f"(tmp[14].y),
                   "=f"(tmp[15].x), "=f"(tmp[15].y)
-                : "r"(d_tt.addr
+                : "r"(output_tt.addr
                       + ((warpgroup::warpid() * 32) << 16)
                       + block * 32));
             tensor_load_wait();
@@ -352,18 +407,19 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
         }
         tensor_before_thread_sync();
         epilogue_group::sync(1);
-        warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+        if (logical_n_offset == UNION_X_RGU_LOGICAL_N_TILES - 1)
+            warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
 
         if (save_context) {
             if (epilogue_group::laneid() == 0) {
                 tma::store_async(
                     gate_context_gmem,
                     gate_raw_smem,
-                    {output_row, tile_coord.y});
+                    {output_row, logical_col});
                 tma::store_async(
                     up_context_gmem,
                     up_raw_smem,
-                    {output_row, tile_coord.y});
+                    {output_row, logical_col});
             }
             epilogue_group::sync(1);
         }
@@ -409,14 +465,18 @@ expert_gate_up_swiglu_union_x_bf16_kernel(
             tma::store_async(
                 hidden_gmem,
                 hidden_raw_smem,
-                {output_row, tile_coord.y});
+                {output_row, logical_col});
             tma::store_async_wait();
+            // Preserve one publication for each old N128 hidden subtile.  A
+            // paired task therefore contributes two arrivals per CTA, leaving
+            // the existing Down required count byte-for-byte unchanged.
             barrier_arrive(
                 hidden_row_block_ready,
                 hidden_row_block_ready_base_index
                     + macrobatch_row_block_offset + tile_coord.x);
         }
         epilogue_group::sync(1);
+        }
     }
     }
 }
