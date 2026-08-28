@@ -68,6 +68,18 @@ class UnionFunctionalSourceTest(unittest.TestCase):
         self.assertLess(build_preflight, all_gather)
         self.assertLess(forward_preflight, launch)
 
+    def test_complete_low_level_preflight_runs_before_first_barrier(self):
+        forward = SOURCE.index("def forward_union_x(")
+        validate = SOURCE.index(
+            "_validate_union_x_forward_args(", forward
+        )
+        copy_x = SOURCE.index("workspace.x_buffer.copy_(x)", forward)
+        barrier = SOURCE.index("barrier_all(", copy_x)
+        self.assertLess(validate, copy_x)
+        self.assertLess(copy_x, barrier)
+        self.assertIn("workspace.ep_size != 8", SOURCE)
+        self.assertIn("workspace.hidden_size != 4096", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from .functional import (
 )
 from .ops import all_gather_top_experts, barrier_all, fwd_epilogue
 from .union_ops import (
+    _validate_union_x_forward_args,
     dispatch_mlp_swiglu_combine_fwd_bf16_union_x,
     union_schedule,
 )
@@ -42,6 +43,8 @@ def _validate_union_config(
     config: MoKConfig,
 ) -> None:
     """Reject Union-X configurations that cannot make forward progress."""
+    if workspace.ep_size != 8 or workspace.hidden_size != 4096:
+        raise ValueError("Union-X forward requires EP8 and H=4096")
     device_properties = torch.cuda.get_device_properties(workspace.device)
     if (
         type(config.fwd_num_comm_sms) is not int
@@ -170,16 +173,28 @@ def forward_union_x(
         router_weights,
     )
     _validate_union_config(workspace, config)
-    for name, weight in (
-        ("shared_gate_weights", shared_gate_weights),
-        ("shared_up_weights", shared_up_weights),
-        ("shared_down_weights", shared_down_weights),
-        ("routed_gate_weights", routed_gate_weights),
-        ("routed_up_weights", routed_up_weights),
-        ("routed_down_weights", routed_down_weights),
-    ):
-        if not isinstance(weight, torch.Tensor):
-            raise TypeError(f"{name} must be a BF16 tensor")
+    _validate_union_x_forward_args(
+        x,
+        workspace.x_buffer_ptrs,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        shared_gate_weights,
+        routed_gate_weights,
+        shared_up_weights,
+        routed_up_weights,
+        shared_down_weights,
+        routed_down_weights,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.route_to_union,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        workspace.topk,
+        swiglu_limit,
+        config.fwd_num_comm_sms,
+        config.macrobatch_size,
+        config.minibatch_size,
+    )
 
     workspace.x_buffer.copy_(x)
     workspace.router_weight_buffer.copy_(router_weights)

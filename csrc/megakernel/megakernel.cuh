@@ -46,7 +46,6 @@ static_assert(
 #include "dispatch_combine.cuh"
 #include "union_x_dispatch.cuh"
 #include "union_x_gather.cuh"
-#include "union_x_fused_gate_up.cuh"
 #include "union_x_routed_gate_up.cuh"
 #include "swiglu.cuh"
 #include "grouped_gemm.cuh"

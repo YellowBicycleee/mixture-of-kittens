@@ -10,17 +10,6 @@
 #include <stdexcept>
 #include <type_traits>
 
-static __host__ at::Tensor union_x_fc1_k64_entrypoint(
-    const at::Tensor &union_x,
-    const at::Tensor &route_to_union,
-    const at::Tensor &gate_weight,
-    const at::Tensor &up_weight
-) {
-    return dispatch_mlp_swiglu_combiner<
-        8, RoutedPrecision::BF16>::union_x_fc1_k64(
-            union_x, route_to_union, gate_weight, up_weight);
-}
-
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor>

@@ -183,6 +183,26 @@ class UnionXForwardSourceContractTest(unittest.TestCase):
         ):
             self.assertIn(tensor, returned)
 
+    def test_low_level_comm_count_preserves_forward_progress(self):
+        self.assertIn(
+            "torch.cuda.get_device_properties(", OPS
+        )
+        self.assertIn(
+            "num_comm_sms must leave at least one compute SM", OPS
+        )
+        self.assertIn(
+            "at::cuda::getDeviceProperties(x.get_device())", FORWARD
+        )
+        self.assertIn(
+            "num_comm_sms < device_properties->multiProcessorCount",
+            FORWARD,
+        )
+
+    def test_retired_fc1_probe_is_not_in_production_abi(self):
+        for source in (MEGAKERNEL, ENTRYPOINTS, BINDINGS, OPS):
+            self.assertNotIn("union_x_fc1_k64", source)
+        self.assertNotIn("union_x_fused_gate_up.cuh", MEGAKERNEL)
+
     def test_high_level_union_forward_is_distinct_and_forward_only(self):
         union_functional = (
             ROOT / "mok" / "union_functional.py"

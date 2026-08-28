@@ -102,73 +102,6 @@ def _union_schedule_fake(
     )
 
 
-def _validate_union_x_fc1_k64_args(
-    union_x: torch.Tensor,
-    route_to_union: torch.Tensor,
-    gate_weight: torch.Tensor,
-    up_weight: torch.Tensor,
-) -> None:
-    for name, tensor in (
-        ("union_x", union_x),
-        ("route_to_union", route_to_union),
-        ("gate_weight", gate_weight),
-        ("up_weight", up_weight),
-    ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be a contiguous CUDA tensor")
-    if union_x.dtype != torch.bfloat16 or union_x.ndim != 2 \
-            or union_x.shape[0] <= 0 or union_x.shape[0] % 128 \
-            or union_x.shape[1] != 4096:
-        raise ValueError(
-            "union_x must be BF16 [U_capacity, 4096] "
-            "with U_capacity divisible by 128"
-        )
-    if route_to_union.dtype != torch.int32 \
-            or tuple(route_to_union.shape) != (256,):
-        raise ValueError("route_to_union must be int32 [256]")
-    if gate_weight.dtype != torch.bfloat16 \
-            or tuple(gate_weight.shape) != (128, 4096):
-        raise ValueError("gate_weight must be BF16 [128, 4096]")
-    if up_weight.dtype != torch.bfloat16 \
-            or tuple(up_weight.shape) != tuple(gate_weight.shape):
-        raise ValueError("up_weight must match gate_weight")
-    if any(tensor.device != union_x.device for tensor in (
-        route_to_union, gate_weight, up_weight
-    )):
-        raise ValueError("all Union-X FC1 K64 tensors must share one device")
-
-
-@torch.library.custom_op("mok::union_x_fc1_k64", mutates_args=())
-def union_x_fc1_k64(
-    union_x: torch.Tensor,
-    route_to_union: torch.Tensor,
-    gate_weight: torch.Tensor,
-    up_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Run one private EP8 BF16 M256xN128xK64 Union-X FC1 slice."""
-    _validate_union_x_fc1_k64_args(
-        union_x, route_to_union, gate_weight, up_weight
-    )
-    return _C.union_x_fc1_k64(
-        union_x, route_to_union, gate_weight, up_weight
-    )
-
-
-@torch.library.register_fake("mok::union_x_fc1_k64")
-def _union_x_fc1_k64_fake(
-    union_x: torch.Tensor,
-    route_to_union: torch.Tensor,
-    gate_weight: torch.Tensor,
-    up_weight: torch.Tensor,
-) -> torch.Tensor:
-    _validate_union_x_fc1_k64_args(
-        union_x, route_to_union, gate_weight, up_weight
-    )
-    return union_x.new_empty((256, 256), dtype=torch.float32)
-
-
 def _validate_union_x_forward_args(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -240,6 +173,10 @@ def _validate_union_x_forward_args(
         or num_comm_sms % 2
     ):
         raise ValueError("num_comm_sms must be a positive even integer")
+    if num_comm_sms >= torch.cuda.get_device_properties(
+        x.device
+    ).multi_processor_count:
+        raise ValueError("num_comm_sms must leave at least one compute SM")
     if (
         type(minibatch_size) is not int
         or minibatch_size <= 0

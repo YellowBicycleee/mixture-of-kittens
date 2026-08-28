@@ -15,9 +15,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
     m.def("union_schedule", &union_scheduler::schedule_entrypoint, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
-    m.def("union_x_fc1_k64", &union_x_fc1_k64_entrypoint, "",
-          pybind11::arg("union_x"), pybind11::arg("route_to_union"),
-          pybind11::arg("gate_weight"), pybind11::arg("up_weight"));
     m.def("mxfp8_quantize", &mxfp8::quantize_entrypoint, "",
           pybind11::arg("x_bf16"),
           pybind11::arg("return_normal"), pybind11::arg("return_transposed"));

@@ -577,6 +577,11 @@ dispatch_mlp_swiglu_combine_fwd_bf16_union_x(
             && macrobatch_size > 0
             && macrobatch_size % minibatch_size == 0,
         "invalid Union-X topk, COMM-SM, macro, or minibatch configuration");
+    const auto *device_properties =
+        at::cuda::getDeviceProperties(x.get_device());
+    TORCH_CHECK(
+        num_comm_sms < device_properties->multiProcessorCount,
+        "Union-X num_comm_sms must leave at least one compute SM");
 
     const at::Device device = x.device();
     for (const at::Tensor *tensor : {
