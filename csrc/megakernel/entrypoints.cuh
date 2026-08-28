@@ -10,6 +10,17 @@
 #include <stdexcept>
 #include <type_traits>
 
+static __host__ at::Tensor union_x_fc1_k64_entrypoint(
+    const at::Tensor &union_x,
+    const at::Tensor &route_to_union,
+    const at::Tensor &gate_weight,
+    const at::Tensor &up_weight
+) {
+    return dispatch_mlp_swiglu_combiner<
+        8, RoutedPrecision::BF16>::union_x_fc1_k64(
+            union_x, route_to_union, gate_weight, up_weight);
+}
+
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor>
@@ -222,6 +233,59 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_bf16 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
     }
+}
+
+// Private parallel EP8 BF16 forward.  It deliberately bypasses the legacy
+// environment selector so the legacy forward ABI and specializations remain
+// unchanged while Union-X is compiled as exactly CLC1/G1/D1.
+static __host__ std::tuple<
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+dispatch_mlp_swiglu_combine_fwd_bf16_union_x_entrypoint(
+    const at::Tensor &x,
+    const std::vector<int64_t> &x_ptrs,
+    const at::Tensor &combine_buffer,
+    const std::vector<int64_t> &combine_buffer_ptrs,
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_shared_down,
+    const at::Tensor &w_routed_down,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &route_to_union,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+    int topk,
+    std::optional<float> swiglu_limit,
+    int num_comm_sms,
+    int macrobatch_size,
+    int minibatch_size
+) {
+    using union_x_impl = dispatch_mlp_swiglu_combiner<
+        8, RoutedPrecision::BF16, 1, 1, 1>;
+    return union_x_impl::dispatch_mlp_swiglu_combine_fwd_bf16_union_x(
+        x,
+        x_ptrs,
+        combine_buffer,
+        combine_buffer_ptrs,
+        w_shared_gate,
+        w_routed_gate,
+        w_shared_up,
+        w_routed_up,
+        w_shared_down,
+        w_routed_down,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        route_to_union,
+        num_tokens,
+        tokens_per_expert,
+        topk,
+        swiglu_limit,
+        num_comm_sms,
+        macrobatch_size,
+        minibatch_size);
 }
 
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
