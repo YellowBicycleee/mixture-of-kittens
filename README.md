@@ -53,6 +53,13 @@ To build for SM100 instead, set the `MOK_ARCH` environment variable:
 MOK_ARCH=SM100 pip install . --no-build-isolation
 ```
 
+The optional CuTe DSL forward requires its pinned CUTLASS DSL and QuACK
+dependencies:
+
+```bash
+pip install ".[cutedsl]" --no-build-isolation
+```
+
 To verify the installation:
 
 ```bash
@@ -115,6 +122,9 @@ a fixed minibatch or communication-SM range as a universal recommendation.
   weight-gradient partials may be added in a different order, so it is not
   bitwise deterministic. All ranks in an expert-parallel group must use the
   same setting.
+- `fwd_backend` (default: `"cuda"`): selects the forward implementation.
+  `"cuda"` retains the original CUDA kernel. `"cutedsl"` explicitly selects
+  the optional persistent CuTe DSL BF16 specialization described below.
 - `schedule_capacity_multiplier` (default: `0.5`): positive finite capacity
   factor for the routed schedule. Size it for the worst expected expert
   imbalance; lowering it does not materially reduce the main activation or
@@ -132,6 +142,16 @@ must cover the maximum padded routed-row count across ranks. At `B=C`, select
 the tuned legacy macrobatch path rather than forcing the fine specialization.
 Every EP rank must use the same selected forward configuration and the same
 selected backward configuration.
+
+The first CuTe DSL specialization is deliberately narrow: SM103 (validated on
+eight B300 GPUs), EP8 with 64 local experts, H=4096, I=1024, top-k=10, BF16
+routed weights, `macrobatch_size=32768`, `minibatch_size=4096`,
+`fwd_num_comm_sms=40`, and unclamped SwiGLU. Unsupported configurations raise
+an error; they never fall back silently to another forward. The backward pass
+continues to use the existing CUDA implementation. See the [CuTe DSL BF16
+forward update](docs/updates/2026-08-29-cutedsl-bf16-fwd/README.md) for the
+correctness contract, measured B300 result, optimization history, and current
+limitations.
 
 See [EP8 MXFP8 backward: full-context forward and a fine backward
 ring](docs/bwd-ep8-minibatch-pipeline.md) for the execution contract, memory

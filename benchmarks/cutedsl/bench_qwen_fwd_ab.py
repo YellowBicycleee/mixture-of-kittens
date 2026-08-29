@@ -3,12 +3,13 @@
 
 Run on one eight-B300 node with ``torchrun --standalone --nproc-per-node=8``.
 The two small cases check one- and two-macro correctness.  The 100K/rank case
-uses a 32K macrobatch and captures the raw nine-tensor forward ABI before BWD
-can rewrite its ring buffers.  A parity failure is fsynced as per-rank JSON
-before raising.  Only after parity, six CUDA communication-SM counts are
-screened and the winner runs in CUDA-CuTe-CuTe-CUDA W10/N30 order.  CUDA Events
-bracket only ``functional.forward``; schedule construction and the first CuTe
-compilation call are outside the measured boundary.
+uses a 32K macrobatch and runs every forward immediately followed by backward,
+then clones the result before the next forward can reuse workspace storage.  A
+parity failure is fsynced as per-rank JSON before raising.  Only after parity,
+the supported comm40 configuration runs in CUDA-CuTe-CuTe-CUDA W10/N30 order.
+CUDA Events bracket only
+``functional.forward``; schedule construction and the first CuTe compilation
+call are outside the measured boundary.
 """
 
 from __future__ import annotations
@@ -27,10 +28,8 @@ LOCAL_EXPERTS = EXPERTS // EP
 CORRECTNESS_CASES = ((2048, 1), (4096, 2))
 TIMING_TOKENS = 102400
 WARMUPS, SAMPLES = 10, 30
-SCREEN_WARMUPS, SCREEN_SAMPLES = 3, 10
 FORMAL_ORDER = ("cuda", "cutedsl", "cutedsl", "cuda")
 MACROBATCH, MINIBATCH = 32768, 4096
-CUDA_COMM_CANDIDATES = (36, 40, 44, 48, 52, 56)
 RESULT_NAMES = (
     "output",
     "d_x",
@@ -50,8 +49,12 @@ FORWARD_CONTEXT_NAMES = (
     "up_routed",
     "hidden_shared",
     "hidden_routed",
-    "y_shared",
-    "y_routed",
+)
+FORWARD_NAMES = ("output", *(f"context.{name}" for name in FORWARD_CONTEXT_NAMES))
+COMPARISON_GROUPS = (
+    "cuda1_vs_cuda2",
+    "cuda1_vs_cutedsl",
+    "cuda2_vs_cutedsl",
 )
 
 
@@ -59,12 +62,13 @@ def static_self_test() -> dict[str, object]:
     assert EP == 8 and EXPERTS // EP == 64
     assert FORMAL_ORDER == ("cuda", "cutedsl", "cutedsl", "cuda")
     assert WARMUPS == 10 and SAMPLES == 30
-    assert SCREEN_WARMUPS == 3 and SCREEN_SAMPLES == 10
     assert MACROBATCH == 2**15 and MINIBATCH == 2**12
     assert MACROBATCH % MINIBATCH == 0
-    assert CUDA_COMM_CANDIDATES == (36, 40, 44, 48, 52, 56)
     assert len(RESULT_NAMES) == 9
-    assert len(FORWARD_CONTEXT_NAMES) == 9
+    assert len(FORWARD_NAMES) == 8
+    assert COMPARISON_GROUPS == (
+        "cuda1_vs_cuda2", "cuda1_vs_cutedsl", "cuda2_vs_cutedsl",
+    )
     assert json_number(float("nan")) is None and json_number(1.25) == 1.25
     return {
         "status": "PASS",
@@ -74,10 +78,13 @@ def static_self_test() -> dict[str, object]:
         "correctness_tokens": [case[0] for case in CORRECTNESS_CASES],
         "full_scale_cuda_parity_tokens": TIMING_TOKENS,
         "full_scale_expected_generations": 32,
+        "full_scale_forward_metrics": list(FORWARD_NAMES),
+        "full_scale_comparison_groups": list(COMPARISON_GROUPS),
         "timing_tokens": TIMING_TOKENS,
         "macrobatch": MACROBATCH,
         "minibatch": MINIBATCH,
-        "cuda_comm_screen": list(CUDA_COMM_CANDIDATES),
+        "bwd_schedule": "macrobatch",
+        "fwd_num_comm_sms": 40,
         "formal_order": list(FORMAL_ORDER),
         "warmups": WARMUPS,
         "samples": SAMPLES,
@@ -85,19 +92,18 @@ def static_self_test() -> dict[str, object]:
 
 
 def load_runtime() -> None:
-    global torch, dist, functional, contract
+    global torch, dist, functional
     global BF16_TOLERANCE, generate_inputs, get_error_stats, run_reference_bf16
     import torch as _torch
     import torch.distributed as _dist
     from mok import functional as _functional
-    from mok.cutedsl import forward_contract as _contract
     from tests.utils import (
         BF16_TOLERANCE as _tolerance,
         generate_inputs as _generate_inputs,
         get_error_stats as _get_error_stats,
         run_reference_bf16 as _run_reference_bf16,
     )
-    torch, dist, functional, contract = _torch, _dist, _functional, _contract
+    torch, dist, functional = _torch, _dist, _functional
     BF16_TOLERANCE, generate_inputs = _tolerance, _generate_inputs
     get_error_stats, run_reference_bf16 = _get_error_stats, _run_reference_bf16
 
@@ -108,7 +114,7 @@ def make_config(macro: int, mini: int, comm: int, backend: str):
         bwd_num_comm_sms=36,
         minibatch_size=mini,
         macrobatch_size=macro,
-        bwd_schedule="minibatch",
+        bwd_schedule="macrobatch",
         fwd_backend=backend,
     )
 
@@ -279,34 +285,10 @@ def parity_metric(name: str, category: str, reference, actual,
     return global_metric, local
 
 
-def unavailable_local_metric(name: str, category: str,
-                             reason: str) -> dict[str, object]:
-    return {
-        "name": name,
-        "category": category,
-        "reference_shape": None,
-        "actual_shape": None,
-        "shape_match": False,
-        "reference_dtype": None,
-        "actual_dtype": None,
-        "dtype_match": False,
-        "reference_finite": False,
-        "actual_finite": False,
-        "finite": False,
-        "abs_error_mean": None,
-        "max_abs_error": None,
-        "relative_l1_error": None,
-        "atol": BF16_TOLERANCE[0],
-        "relative_l1_tolerance": BF16_TOLERANCE[1],
-        "pass": False,
-        "unavailable_reason": reason,
-    }
-
-
 def routed_rows(schedule, device) -> list[int]:
-    if type(schedule.num_tokens_host) is not int:
-        raise AssertionError("cached CuTe schedule lacks num_tokens_host")
-    local = torch.tensor([schedule.num_tokens_host], dtype=torch.int64, device=device)
+    # Diagnostics may synchronize after schedule construction; neither backend
+    # needs a host mirror in the production schedule path.
+    local = schedule.num_tokens.to(dtype=torch.int64)
     gathered = torch.empty(EP, dtype=torch.int64, device=device)
     dist.all_gather_into_tensor(gathered, local)
     return [int(value) for value in gathered.cpu().tolist()]
@@ -326,51 +308,52 @@ def make_case(tokens: int, config, rank: int, device):
     return inputs, workspace, schedule
 
 
-def checked_forward(config, workspace, schedule, inputs, local_rank: int):
+def checked_forward_backward(config, workspace, schedule, inputs,
+                             local_rank: int):
+    """Run one public FWD->BWD leg and snapshot it before workspace reuse."""
+
     workspace.combine_buffer.fill_(float("nan"))
     dist.barrier(device_ids=[local_rank])
-    output, context = forward(config, workspace, schedule, inputs)
-    torch.cuda.synchronize(workspace.device)
-    return output, context
-
-
-def checked_forward_with_abi(config, workspace, schedule, inputs,
-                             local_rank: int):
-    """Run ``functional.forward`` while retaining its raw nine-tensor ABI."""
-
-    captured: list[tuple[object, ...]] = []
     if config.fwd_backend == "cuda":
         owner = functional
         attribute = "dispatch_mlp_swiglu_combine_fwd_bf16"
     else:
         import importlib
 
-        owner = importlib.import_module("mok.cutedsl.forward")
+        owner = importlib.import_module("mok.cutedsl.persistent_bf16")
         attribute = "forward_bf16"
     original = getattr(owner, attribute)
+    call_count = 0
 
     def capture(*args, **kwargs):
-        tensors = original(*args, **kwargs)
-        captured.append(tuple(tensors))
-        return tensors
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
 
-    workspace.combine_buffer.fill_(float("nan"))
-    dist.barrier(device_ids=[local_rank])
     setattr(owner, attribute, capture)
     try:
         output, context = forward(config, workspace, schedule, inputs)
+        gradients = backward(config, workspace, schedule, context, inputs)
     finally:
         setattr(owner, attribute, original)
+    if call_count != 1:
+        raise AssertionError(
+            f"{config.fwd_backend} forward route called {call_count} times"
+        )
+    if len(gradients) != len(RESULT_NAMES) - 1:
+        raise AssertionError("backward did not return exactly eight gradients")
     torch.cuda.synchronize(workspace.device)
-    raw_abi = captured[0] if len(captured) == 1 else ()
-    return output, context, raw_abi
+    forward_tensors = (
+        output.clone(),
+        *(getattr(context, name).clone() for name in FORWARD_CONTEXT_NAMES),
+    )
+    gradients = tuple(tensor.clone() for tensor in gradients)
+    torch.cuda.synchronize(workspace.device)
+    return forward_tensors, gradients
 
 
 def local_schedule_diagnostic(schedule, rank: int) -> dict[str, object]:
-    host_tokens = schedule.num_tokens_host
-    num_tokens = (
-        host_tokens if type(host_tokens) is int else int(schedule.num_tokens.item())
-    )
+    num_tokens = int(schedule.num_tokens.item())
     valid_tokens = int(
         schedule.peer_rank[:num_tokens].ge(0).sum(dtype=torch.int64).item()
     )
@@ -438,10 +421,9 @@ def persist_full_scale_failure(local_diagnostic: dict[str, object]) -> str:
             "macrobatch": MACROBATCH,
             "minibatch": MINIBATCH,
             "expected_generations": 32,
-            "acceptance_tensors": list(RESULT_NAMES),
-            "forward_context_tensors_diagnostic_only": list(
-                FORWARD_CONTEXT_NAMES
-            ),
+            "forward_acceptance_tensors": list(FORWARD_NAMES),
+            "gradient_acceptance_tensors": list(RESULT_NAMES[1:]),
+            "comparison_groups": list(COMPARISON_GROUPS),
             "rank_diagnostics": gathered,
             "timing_started": False,
         }
@@ -467,25 +449,18 @@ def correctness_case(tokens: int, expected_generations: int, rank: int,
     inputs, workspace, schedule = make_case(tokens, cute_config, rank, device)
     reference = run_reference_bf16(*inputs)
     with torch.no_grad():
-        cuda_output, cuda_context = checked_forward(
+        cuda_forward, cuda_gradients = checked_forward_backward(
             cuda_config, workspace, schedule, inputs, local_rank
         )
-        cuda_gradients = backward(
-            cuda_config, workspace, schedule, cuda_context, inputs
-        )
-        cute_output, cute_context = checked_forward(
+        cute_forward, cute_gradients = checked_forward_backward(
             cute_config, workspace, schedule, inputs, local_rank
         )
-        cute_gradients = backward(
-            cute_config, workspace, schedule, cute_context, inputs
-        )
-        torch.cuda.synchronize(device)
 
     comparisons = [
         metric(f"{backend}/{name}", expected, actual)
         for backend, actuals in (
-            ("cuda", (cuda_output, *cuda_gradients)),
-            ("cutedsl", (cute_output, *cute_gradients)),
+            ("cuda", (cuda_forward[0], *cuda_gradients)),
+            ("cutedsl", (cute_forward[0], *cute_gradients)),
         )
         for name, expected, actual in zip(
             RESULT_NAMES, reference, actuals, strict=True
@@ -503,7 +478,7 @@ def correctness_case(tokens: int, expected_generations: int, rank: int,
         "tokens_per_rank": tokens,
         "fixed_seed": "1234 + EP rank (tests.utils.generate_inputs)",
         "macrobatch": MACROBATCH,
-        "minibatch_bwd": True,
+        "bwd_schedule": "macrobatch",
         "padded_routed_rows_by_rank": rows,
         "generations_by_rank": generations,
         "expected_generations": expected_generations,
@@ -514,157 +489,124 @@ def correctness_case(tokens: int, expected_generations: int, rank: int,
 
 def full_scale_parity_case(inputs, workspace, schedule, local_rank: int,
                            device) -> dict[str, object]:
-    """Check all 32 replay generations against the trusted CUDA backend."""
+    """Validate public FWD contexts plus CUDA BWD before timing."""
 
     cuda_config = make_config(MACROBATCH, MINIBATCH, 40, "cuda")
     cute_config = make_config(MACROBATCH, MINIBATCH, 40, "cutedsl")
     with torch.no_grad():
-        cuda_output, cuda_context, cuda_forward_abi = checked_forward_with_abi(
-            cuda_config, workspace, schedule, inputs, local_rank
-        )
-        cute_output, cute_context, cute_forward_abi = checked_forward_with_abi(
-            cute_config, workspace, schedule, inputs, local_rank
-        )
+        legs = {
+            "cuda1": checked_forward_backward(
+                cuda_config, workspace, schedule, inputs, local_rank
+            ),
+            "cuda2": checked_forward_backward(
+                cuda_config, workspace, schedule, inputs, local_rank
+            ),
+            "cutedsl": checked_forward_backward(
+                cute_config, workspace, schedule, inputs, local_rank
+            ),
+        }
 
-        output_comparison, local_output = parity_metric(
-            "cutedsl_vs_cuda/output", "forward_output",
-            cuda_output, cute_output, device,
-        )
-        cuda_abi_count = len(cuda_forward_abi)
-        cute_abi_count = len(cute_forward_abi)
-        local_abi_ok = (
-            cuda_abi_count == len(FORWARD_CONTEXT_NAMES)
-            and cute_abi_count == len(FORWARD_CONTEXT_NAMES)
-        )
-        abi_ok = all_ranks_true(local_abi_ok, device)
-        forward_context_comparisons = []
-        local_forward_contexts = []
-        if abi_ok:
-            for name, expected, actual in zip(
-                FORWARD_CONTEXT_NAMES,
-                cuda_forward_abi,
-                cute_forward_abi,
-                strict=True,
-            ):
-                comparison, local = parity_metric(
-                    f"cutedsl_vs_cuda/{name}",
-                    "forward_context_diagnostic_only",
-                    expected,
-                    actual,
-                    device,
-                )
-                forward_context_comparisons.append(comparison)
-                local_forward_contexts.append(local)
-        else:
-            local_forward_contexts = [
-                unavailable_local_metric(
-                    f"cutedsl_vs_cuda/{name}",
-                    "forward_context_diagnostic_only",
-                    "raw forward ABI did not contain exactly nine tensors",
-                )
-                for name in FORWARD_CONTEXT_NAMES
-            ]
+    pairs = {
+        "cuda1_vs_cuda2": (legs["cuda1"], legs["cuda2"]),
+        "cuda1_vs_cutedsl": (legs["cuda1"], legs["cutedsl"]),
+        "cuda2_vs_cutedsl": (legs["cuda2"], legs["cutedsl"]),
+    }
+    comparisons: dict[str, dict[str, object]] = {}
+    local_comparisons: dict[str, dict[str, object]] = {}
 
-        # Backward replay mutates routed context ring buffers.  Their CUDA-vs-
-        # CuTe diagnostic above must therefore finish before either BWD starts.
-        cuda_forward_abi = cute_forward_abi = None
-        cuda_gradients = backward(
-            cuda_config, workspace, schedule, cuda_context, inputs
-        )
-        torch.cuda.synchronize(device)
-        cute_gradients = backward(
-            cute_config, workspace, schedule, cute_context, inputs
-        )
-        torch.cuda.synchronize(device)
-
-    gradient_count_ok = all_ranks_true(
-        len(cuda_gradients) == len(RESULT_NAMES) - 1
-        and len(cute_gradients) == len(RESULT_NAMES) - 1,
-        device,
-    )
-    gradient_comparisons = []
-    local_gradients = []
-    if gradient_count_ok:
+    def compare_group(group_name: str) -> bool:
+        (reference_forward, reference_gradients), (
+            actual_forward, actual_gradients,
+        ) = pairs[group_name]
+        forward_records = []
+        local_forward_records = []
         for name, expected, actual in zip(
-            RESULT_NAMES[1:], cuda_gradients, cute_gradients, strict=True
+            FORWARD_NAMES, reference_forward, actual_forward, strict=True
         ):
-            comparison, local = parity_metric(
-                f"cutedsl_vs_cuda/{name}", "backward_gradient",
-                expected, actual, device,
+            record, local = parity_metric(
+                f"{group_name}/{name}", "forward", expected, actual, device
             )
-            gradient_comparisons.append(comparison)
-            local_gradients.append(local)
-    else:
-        local_gradients = [
-            unavailable_local_metric(
-                f"cutedsl_vs_cuda/{name}",
+            forward_records.append(record)
+            local_forward_records.append(local)
+        gradient_records = []
+        local_gradient_records = []
+        for name, expected, actual in zip(
+            RESULT_NAMES[1:], reference_gradients, actual_gradients, strict=True
+        ):
+            record, local = parity_metric(
+                f"{group_name}/{name}",
                 "backward_gradient",
-                "backward did not return exactly eight gradients",
+                expected,
+                actual,
+                device,
             )
-            for name in RESULT_NAMES[1:]
-        ]
-    comparisons = [output_comparison, *gradient_comparisons]
+            gradient_records.append(record)
+            local_gradient_records.append(local)
+        passed = all_ranks_true(
+            all(bool(record["pass"])
+                for record in (*forward_records, *gradient_records)),
+            device,
+        )
+        comparisons[group_name] = {
+            "forward": forward_records,
+            "gradients": gradient_records,
+            "pass": passed,
+        }
+        local_comparisons[group_name] = {
+            "forward": local_forward_records,
+            "gradients": local_gradient_records,
+            "pass": passed,
+        }
+        return passed
+
     rank = dist.get_rank()
     schedule_diagnostic = local_schedule_diagnostic(schedule, rank)
-    generation_pass = schedule_diagnostic["generations"] == 32
-    passed = all_ranks_true(
-        generation_pass
-        and gradient_count_ok
-        and all(bool(item["pass"]) for item in comparisons),
-        device,
+    generation_pass = all_ranks_true(
+        schedule_diagnostic["generations"] == 32, device
     )
+    self_control_pass = compare_group("cuda1_vs_cuda2")
+    cross_context_evaluated = self_control_pass
+    cross_context_pass = False
+    if self_control_pass:
+        cuda1_cutedsl_pass = compare_group("cuda1_vs_cutedsl")
+        cuda2_cutedsl_pass = compare_group("cuda2_vs_cutedsl")
+        cross_context_pass = cuda1_cutedsl_pass and cuda2_cutedsl_pass
+    passed = generation_pass and self_control_pass and cross_context_pass
     if not passed:
         diagnostic = {
             "rank": rank,
             "schedule": schedule_diagnostic,
-            "forward": {
-                "output": local_output,
-                "contexts": {
-                    "diagnostic_only": True,
-                    "affects_acceptance": False,
-                    "cuda_abi_tensor_count": cuda_abi_count,
-                    "cutedsl_abi_tensor_count": cute_abi_count,
-                    "comparisons": local_forward_contexts,
-                },
-            },
-            "backward": {"gradients": local_gradients},
+            "comparisons": local_comparisons,
             "acceptance": {
                 "generation_pass": generation_pass,
-                "output_and_eight_gradients_pass": all(
-                    bool(item["pass"]) for item in comparisons
-                ) and gradient_count_ok,
-                "cuda_gradient_tensor_count": len(cuda_gradients),
-                "cutedsl_gradient_tensor_count": len(cute_gradients),
+                "self_control_pass": self_control_pass,
+                "cross_context_evaluated": cross_context_evaluated,
+                "cross_context_pass": cross_context_pass,
                 "pass": False,
             },
         }
         path = persist_full_scale_failure(diagnostic)
         raise AssertionError(
-            "T=102400 BF16 CUDA-vs-CuTe parity failed; "
+            "T=102400 BF16 public FWD/CUDA-BWD parity failed; "
             f"diagnostic={path}"
         )
     rows = routed_rows(schedule, device)
     generations = [(value + MACROBATCH - 1) // MACROBATCH for value in rows]
     return {
         "tokens_per_rank": TIMING_TOKENS,
-        "reference": "trusted CUDA backend at the same source revision",
+        "reference": "two trusted CUDA legs at the same source revision",
         "fixed_seed": "1234 + EP rank (tests.utils.generate_inputs)",
         "macrobatch": MACROBATCH,
-        "minibatch_bwd": True,
+        "bwd_schedule": "macrobatch",
         "padded_routed_rows_by_rank": rows,
         "generations_by_rank": generations,
         "expected_generations": 32,
+        "comparison_order": list(COMPARISON_GROUPS),
+        "forward_names": list(FORWARD_NAMES),
+        "gradient_names": list(RESULT_NAMES[1:]),
+        "self_control_pass": self_control_pass,
+        "cross_context_pass": cross_context_pass,
         "comparisons": comparisons,
-        "forward_context_diagnostic_only": {
-            "affects_acceptance": False,
-            "captured_nine_tensor_abi_on_all_ranks": abi_ok,
-            "comparisons": forward_context_comparisons,
-            "pass": (
-                abi_ok
-                and all(bool(item["pass"])
-                        for item in forward_context_comparisons)
-            ),
-        },
         "pass": passed,
     }
 
@@ -700,28 +642,6 @@ def measure_launch(backend: str, run, device, *, warmups: int = WARMUPS,
         "min_rank_max_ms": float(rank_max.min().item()),
         "max_rank_max_ms": float(rank_max.max().item()),
         "rank_max_samples_ms": rank_max.cpu().tolist(),
-    }
-
-
-def screen_cuda_comm(inputs, workspace, schedule, device) -> dict[str, object]:
-    cells = []
-    for comm in CUDA_COMM_CANDIDATES:
-        config = make_config(MACROBATCH, MINIBATCH, comm, "cuda")
-        run = lambda config=config: forward(config, workspace, schedule, inputs)
-        output, context = run()
-        torch.cuda.synchronize(device)
-        output = context = None
-        cells.append(measure_launch(
-            "cuda", run, device,
-            warmups=SCREEN_WARMUPS, samples=SCREEN_SAMPLES,
-        ) | {"fwd_num_comm_sms": comm})
-    winner = min(cells, key=lambda cell: cell["median_rank_max_ms"])
-    return {
-        "macrobatch": MACROBATCH,
-        "minibatch": MINIBATCH,
-        "cells": cells,
-        "selected_fwd_num_comm_sms": winner["fwd_num_comm_sms"],
-        "selection_rule": "minimum quick-screen median rank-max CUDA Event time",
     }
 
 
@@ -818,12 +738,7 @@ def main() -> None:
         full_scale_parity_case(inputs, workspace, schedule, local_rank, device)
     )
     properties = torch.cuda.get_device_properties(device)
-    dispatch_ctas, combine_ctas = contract.standalone_comm_worker_grids(
-        properties.multi_processor_count
-    )
-    cuda_screen = screen_cuda_comm(inputs, workspace, schedule, device)
-    selected_comm = int(cuda_screen["selected_fwd_num_comm_sms"])
-    timing = [timing_case(selected_comm, inputs, workspace, schedule, device)]
+    timing = [timing_case(40, inputs, workspace, schedule, device)]
     payload = {
         "status": "PASS",
         "comparison": "MoK BF16 CUDA FWD vs BF16 CuTe DSL FWD",
@@ -836,20 +751,10 @@ def main() -> None:
         "timing": {
             "tokens_per_rank": TIMING_TOKENS,
             "cached_schedule_builds": 1,
-            "cuda_comm_screen": cuda_screen,
-            "deferred_macrobatches": [131072, 262144, 524288, 1048576],
             "padded_routed_rows_by_rank": rows,
             "boundary": "CUDA Events around functional.forward only",
             "aggregation": "per-iteration EP8 rank maximum, then launch median",
             "first_backend_call_inside_events": False,
-            "cutedsl_actual_fixed_grid": {
-                "physical_sms": properties.multi_processor_count,
-                "dispatch_ctas": dispatch_ctas,
-                "dispatch_ctas_per_sm": contract.DISPATCH_CTAS_PER_SM,
-                "combine_ctas": combine_ctas,
-                "combine_ctas_per_sm": 1,
-                "public_fwd_num_comm_sms_tunes_grid": False,
-            },
             "points": timing,
         },
     }

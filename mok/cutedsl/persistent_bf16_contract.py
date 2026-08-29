@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 
 EP_SIZE = 8
+NUM_LOCAL_EXPERTS = 64
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 1024
 MACROBATCH_ROWS = 32768
@@ -21,7 +22,8 @@ MINIBATCH_ROWS = 4096
 ROW_ALIGNMENT = 256
 CLUSTER_SIZE = 2
 MINIBATCHES_PER_MACROBATCH = MACROBATCH_ROWS // MINIBATCH_ROWS
-TASK_ORDER = "row_major_global_rows"
+MLP_SUPERGROUP_SIZE = 8
+TASK_ORDER = "expert_segment_supergroup8"
 
 # One persistent compute claim denotes one two-CTA cluster task.
 FC1_TILE_M = 256
@@ -114,14 +116,23 @@ class ReadyKey:
             raise ValueError("y_done part is outside the minibatch")
 
     @property
-    def counter_index(self) -> int:
-        """Index in the kind-specific, full-context device counter array."""
+    def routed_counter_index(self) -> int:
+        """Routed-relative index before CUDA's shared hidden prefix."""
 
         if self.kind == HIDDEN_READY:
             return self.generation * FC1_ROW_TILES + self.part
         if self.kind == Y_DONE:
             return self.generation * Y_DONE_PARTS + self.part
         return self.generation
+
+    def physical_counter_index(self, *, shared_row_blocks: int) -> int:
+        """Physical index in CUDA's allocated kind-specific counter array."""
+
+        if type(shared_row_blocks) is not int or shared_row_blocks < 0:
+            raise ValueError("shared_row_blocks must be a non-negative integer")
+        if self.kind == HIDDEN_READY:
+            return shared_row_blocks + self.routed_counter_index
+        return self.routed_counter_index
 
     @property
     def linear_id(self) -> int:
@@ -216,10 +227,10 @@ class MiniBatch:
 class TaskClaim:
     """One CTA-local comm task or one two-CTA compute-cluster task.
 
-    Stage 2 deliberately enumerates global row tiles first and column tiles
-    second.  This is not CUDA's expert-segment/supergroup-swizzled raw task
-    index.  The device decoder must use these explicit coordinates, then map
-    the global row tile to its padded expert via the expert-prefix table.
+    Compute tasks use CUDA's raw task order: expert segments are visited in
+    ascending expert order, then each expert/minibatch intersection applies
+    the ThunderKittens supergroup-8 row/column swizzle.  ``row_tile`` remains
+    minibatch-local; ``expert_index`` records the owning padded expert.
     """
 
     role: str
@@ -230,6 +241,7 @@ class TaskClaim:
     waits: tuple[ReadyKey, ...]
     arrival: ReadyKey
     arrival_count: int = 1
+    expert_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.role not in (DISPATCH_ROLE, FC1_ROLE, DOWN_ROLE, COMBINE_ROLE):
@@ -244,8 +256,39 @@ class TaskClaim:
             raise ValueError("column_tile must be a non-negative integer")
         if type(self.arrival_count) is not int or self.arrival_count <= 0:
             raise ValueError("arrival_count must be a positive integer")
+        if self.expert_index is not None and (
+            type(self.expert_index) is not int
+            or not 0 <= self.expert_index < NUM_LOCAL_EXPERTS
+        ):
+            raise ValueError("expert_index is outside the local expert range")
         if self.arrival.generation != self.generation:
             raise ABAHazardError("task arrival uses a different generation")
+
+
+@dataclass(frozen=True)
+class SharedTaskClaim:
+    """One raw shared-expert FC1 or Down cluster task."""
+
+    role: str
+    task_index: int
+    row_tile: int
+    column_tile: int
+    hidden_ready_index: int
+    hidden_ready_required: int
+
+    def __post_init__(self) -> None:
+        if self.role not in (FC1_ROLE, DOWN_ROLE):
+            raise ValueError("shared task role must be fc1 or down")
+        for name, value in (
+            ("task_index", self.task_index),
+            ("row_tile", self.row_tile),
+            ("column_tile", self.column_tile),
+            ("hidden_ready_index", self.hidden_ready_index),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.hidden_ready_required) is not int or self.hidden_ready_required < 0:
+            raise ValueError("hidden_ready_required must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -404,31 +447,222 @@ def dispatch_claims(
     return tuple(claims)
 
 
+def swizzled_mlp_tile_coord(
+    row_blocks: int,
+    column_blocks: int,
+    task_index: int,
+) -> tuple[int, int]:
+    """Mirror ``get_swizzled_2d_idx<8>`` used by both CUDA GEMMs."""
+
+    if type(row_blocks) is not int or row_blocks <= 0:
+        raise ValueError("row_blocks must be a positive integer")
+    if type(column_blocks) is not int or column_blocks <= 0:
+        raise ValueError("column_blocks must be a positive integer")
+    if (
+        type(task_index) is not int
+        or not 0 <= task_index < row_blocks * column_blocks
+    ):
+        raise ValueError("task_index is outside the MLP tile grid")
+
+    supergroup_numel = row_blocks * MLP_SUPERGROUP_SIZE
+    supergroup_index = task_index // supergroup_numel
+    supersection_columns = (
+        column_blocks // MLP_SUPERGROUP_SIZE
+    ) * MLP_SUPERGROUP_SIZE
+    supersection_numel = row_blocks * supersection_columns
+    if task_index < supersection_numel:
+        row = (task_index % supergroup_numel) // MLP_SUPERGROUP_SIZE
+        column = (
+            supergroup_index * MLP_SUPERGROUP_SIZE
+            + task_index % MLP_SUPERGROUP_SIZE
+        )
+    else:
+        remainder_columns = column_blocks - supersection_columns
+        remainder_task = task_index - supersection_numel
+        row = remainder_task // remainder_columns
+        column = supersection_columns + remainder_task % remainder_columns
+    if supergroup_index % 2:
+        row = row_blocks - row - 1
+    return row, column
+
+
+def _validated_expert_rows(
+    tokens_per_expert: tuple[int, ...],
+) -> tuple[int, ...]:
+    if not isinstance(tokens_per_expert, tuple):
+        raise TypeError("tokens_per_expert must be a tuple")
+    if len(tokens_per_expert) != NUM_LOCAL_EXPERTS:
+        raise ValueError(
+            f"tokens_per_expert must contain {NUM_LOCAL_EXPERTS} local experts"
+        )
+    if any(
+        type(rows) is not int or rows < 0 or rows % ROW_ALIGNMENT
+        for rows in tokens_per_expert
+    ):
+        raise ValueError(
+            "every tokens_per_expert entry must be a non-negative "
+            "256-row-aligned integer"
+        )
+    return tokens_per_expert
+
+
+def _default_expert_rows(
+    schedule: tuple[MiniBatch, ...],
+) -> tuple[int, ...]:
+    """Use one populated expert when a test only exercises DAG geometry."""
+
+    total_rows = sum(minibatch.valid_rows for minibatch in schedule)
+    return (total_rows, *(0 for _ in range(NUM_LOCAL_EXPERTS - 1)))
+
+
+def decoded_mlp_tasks(
+    minibatch: MiniBatch,
+    tokens_per_expert: tuple[int, ...],
+    column_blocks: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Decode all raw tasks as ``(expert, minibatch_row, column)``.
+
+    This is the CPU form of the expert loop in ``fused_gate_up.cuh`` and
+    ``grouped_gemm.cuh``.  The swizzle restarts for every expert/minibatch
+    intersection, exactly as in the device implementation.
+    """
+
+    expert_rows = _validated_expert_rows(tokens_per_expert)
+    if type(column_blocks) is not int or column_blocks <= 0:
+        raise ValueError("column_blocks must be a positive integer")
+    total_rows = sum(expert_rows)
+    minibatch_first_block = minibatch.row_begin // ROW_ALIGNMENT
+    minibatch_end_block = min(
+        minibatch_first_block + FC1_ROW_TILES,
+        total_rows // ROW_ALIGNMENT,
+    )
+    if (
+        minibatch_end_block - minibatch_first_block
+        != minibatch.valid_rows // ROW_ALIGNMENT
+    ):
+        raise ValueError("minibatch extent does not match tokens_per_expert")
+
+    decoded: list[tuple[int, int, int]] = []
+    expert_first_block = 0
+    for expert_index, rows in enumerate(expert_rows):
+        expert_blocks = rows // ROW_ALIGNMENT
+        first = max(minibatch_first_block, expert_first_block)
+        end = min(minibatch_end_block, expert_first_block + expert_blocks)
+        segment_blocks = max(0, end - first)
+        for segment_task in range(segment_blocks * column_blocks):
+            local_row, column = swizzled_mlp_tile_coord(
+                segment_blocks,
+                column_blocks,
+                segment_task,
+            )
+            decoded.append(
+                (
+                    expert_index,
+                    first + local_row - minibatch_first_block,
+                    column,
+                )
+            )
+        expert_first_block += expert_blocks
+
+    expected = minibatch.valid_rows // ROW_ALIGNMENT * column_blocks
+    if len(decoded) != expected:
+        raise ValueError("tokens_per_expert does not cover the minibatch")
+    return tuple(decoded)
+
+
+def shared_compute_claims(num_local_tokens: int) -> tuple[SharedTaskClaim, ...]:
+    """Mirror CUDA's shared fused-FC1 then shared-Down raw task order."""
+
+    if (
+        type(num_local_tokens) is not int
+        or num_local_tokens < FC1_TILE_M
+        or num_local_tokens % FC1_TILE_M
+    ):
+        raise ValueError("num_local_tokens must be a positive multiple of 256")
+    row_blocks = num_local_tokens // FC1_TILE_M
+    fc1 = tuple(
+        SharedTaskClaim(
+            FC1_ROLE,
+            task_index,
+            row_tile,
+            column_tile,
+            row_tile,
+            0,
+        )
+        for task_index in range(row_blocks * FC1_COLUMN_TILES)
+        for row_tile, column_tile in (
+            swizzled_mlp_tile_coord(
+                row_blocks,
+                FC1_COLUMN_TILES,
+                task_index,
+            ),
+        )
+    )
+    down = tuple(
+        SharedTaskClaim(
+            DOWN_ROLE,
+            task_index,
+            row_tile,
+            column_tile,
+            row_tile,
+            HIDDEN_READY_REQUIRED,
+        )
+        for task_index in range(row_blocks * DOWN_COLUMN_TILES)
+        for row_tile, column_tile in (
+            swizzled_mlp_tile_coord(
+                row_blocks,
+                DOWN_COLUMN_TILES,
+                task_index,
+            ),
+        )
+    )
+    return fc1 + down
+
+
 def compute_claims(
     minibatch: MiniBatch,
     schedule: tuple[MiniBatch, ...],
+    tokens_per_expert: tuple[int, ...] | None = None,
 ) -> tuple[TaskClaim, ...]:
-    """Claim row-major FC1 tiles before exposing row-major Down tiles."""
+    """Claim CUDA-ordered fused-FC1 tiles before CUDA-ordered Down tiles."""
 
     generation = minibatch.generation
+    expert_rows = (
+        _default_expert_rows(schedule)
+        if tokens_per_expert is None
+        else _validated_expert_rows(tokens_per_expert)
+    )
+    schedule_rows = sum(item.valid_rows for item in schedule)
+    if sum(expert_rows) != schedule_rows:
+        raise ValueError("tokens_per_expert must sum to the schedule row count")
+    fc1_tiles = decoded_mlp_tasks(
+        minibatch,
+        expert_rows,
+        FC1_COLUMN_TILES,
+    )
     fc1 = tuple(
         TaskClaim(
             FC1_ROLE,
             generation,
             task_index,
-            task_index // FC1_COLUMN_TILES,
-            task_index % FC1_COLUMN_TILES,
+            row_tile,
+            column_tile,
             (ReadyKey(X_READY, generation),),
-            ReadyKey(HIDDEN_READY, generation, task_index // FC1_COLUMN_TILES),
+            ReadyKey(HIDDEN_READY, generation, row_tile),
             CLUSTER_SIZE,
+            expert_index,
         )
-        for task_index in range(minibatch.fc1_tasks)
+        for task_index, (expert_index, row_tile, column_tile) in enumerate(fc1_tiles)
     )
     guards = reuse_guards(minibatch, schedule)
     y_release = tuple(guard.wait for guard in guards if guard.buffer == "y")
     down = []
-    for task_index in range(minibatch.down_tasks):
-        row_tile = task_index // DOWN_COLUMN_TILES
+    down_tiles = decoded_mlp_tasks(
+        minibatch,
+        expert_rows,
+        DOWN_COLUMN_TILES,
+    )
+    for task_index, (expert_index, row_tile, column_tile) in enumerate(down_tiles):
         waits = [ReadyKey(HIDDEN_READY, generation, row_tile)]
         if y_release:
             waits.extend(y_release[2 * row_tile : 2 * row_tile + 2])
@@ -438,10 +672,11 @@ def compute_claims(
                 generation,
                 task_index,
                 row_tile,
-                task_index % DOWN_COLUMN_TILES,
+                column_tile,
                 tuple(waits),
                 ReadyKey(Y_READY, generation),
                 CLUSTER_SIZE,
+                expert_index,
             )
         )
     return fc1 + tuple(down)
@@ -481,10 +716,17 @@ def comm_claims(
     raise ValueError("communication role must be 'dispatch' or 'combine'")
 
 
-def validate_contract(total_rows: int) -> tuple[MiniBatch, ...]:
+def validate_contract(
+    total_rows: int,
+    tokens_per_expert: tuple[int, ...] | None = None,
+) -> tuple[MiniBatch, ...]:
     """Validate unique keys and exact producer counts for the whole schedule."""
 
     schedule = reverse_minibatches(total_rows)
+    if tokens_per_expert is not None:
+        expert_rows = _validated_expert_rows(tokens_per_expert)
+        if sum(expert_rows) != total_rows:
+            raise ValueError("tokens_per_expert must sum to total_rows")
     specs = tuple(spec for minibatch in schedule for spec in readiness_specs(minibatch))
     keys = [spec.key for spec in specs]
     if len(keys) != len(set(keys)):
@@ -497,7 +739,7 @@ def validate_contract(total_rows: int) -> tuple[MiniBatch, ...]:
     for minibatch in schedule:
         claims = (
             dispatch_claims(minibatch, schedule)
-            + compute_claims(minibatch, schedule)
+            + compute_claims(minibatch, schedule, tokens_per_expert)
             + combine_claims(minibatch)
         )
         for claim in claims:

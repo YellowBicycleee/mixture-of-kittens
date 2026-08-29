@@ -66,9 +66,31 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
             )
         )
         self.assertIn(
+            "from .cutedsl.persistent_bf16 import (",
+            _FUNCTIONAL_SOURCE,
+        )
+        self.assertNotIn(
             "from .cutedsl.forward import forward_bf16 as cutedsl_forward_bf16",
             _FUNCTIONAL_SOURCE,
         )
+        self.assertIn('if config.fwd_backend == "cuda":', _FUNCTIONAL_SOURCE)
+        self.assertEqual(
+            _FUNCTIONAL_SOURCE.count(
+                "dispatch_mlp_swiglu_combine_fwd_bf16("
+            ),
+            1,
+        )
+
+    def test_schedule_build_keeps_num_tokens_on_device_for_both_backends(self) -> None:
+        build_schedule = next(
+            node
+            for node in _FUNCTIONAL_TREE.body
+            if isinstance(node, ast.FunctionDef) and node.name == "build_schedule"
+        )
+        source = ast.get_source_segment(_FUNCTIONAL_SOURCE, build_schedule)
+        self.assertIsNotNone(source)
+        self.assertNotIn("num_tokens.item()", source)
+        self.assertNotIn("num_tokens_host=", source)
 
     def test_pipeline_v2_saves_preact_only_for_macro_zero(self) -> None:
         self.assertIs(contract.REPLAY_GATE_UP_STORE_ELISION, True)
@@ -163,6 +185,7 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
 
     def test_bf16_harness_keeps_fixed_seed_output_and_eight_grads(self) -> None:
         self.assertIn("MACROBATCH, MINIBATCH = 32768, 4096", _BENCHMARK_SOURCE)
+        self.assertIn('bwd_schedule="macrobatch"', _BENCHMARK_SOURCE)
         self.assertIn('"fixed_seed": "1234 + EP rank', _BENCHMARK_SOURCE)
         self.assertIn("RESULT_NAMES = (", _BENCHMARK_SOURCE)
         self.assertIn('"output",', _BENCHMARK_SOURCE)
@@ -171,7 +194,36 @@ class CuTeDSLForwardContractTest(unittest.TestCase):
         self.assertIn('"d_router_weights",', _BENCHMARK_SOURCE)
         self.assertIn("def full_scale_parity_case(", _BENCHMARK_SOURCE)
         self.assertIn('"expected_generations": 32', _BENCHMARK_SOURCE)
-        self.assertIn("T=102400 BF16 CUDA-vs-CuTe parity failed", _BENCHMARK_SOURCE)
+        self.assertIn(
+            "T=102400 BF16 public FWD/CUDA-BWD parity failed",
+            _BENCHMARK_SOURCE,
+        )
+        self.assertIn(
+            'owner = importlib.import_module("mok.cutedsl.persistent_bf16")',
+            _BENCHMARK_SOURCE,
+        )
+        self.assertNotIn(
+            'owner = importlib.import_module("mok.cutedsl.forward")',
+            _BENCHMARK_SOURCE,
+        )
+        self.assertIn("def checked_forward_backward(", _BENCHMARK_SOURCE)
+        self.assertIn('"cuda1_vs_cuda2",', _BENCHMARK_SOURCE)
+        self.assertIn('"cuda1_vs_cutedsl",', _BENCHMARK_SOURCE)
+        self.assertIn('"cuda2_vs_cutedsl",', _BENCHMARK_SOURCE)
+        self.assertIn(
+            "gradients = backward(config, workspace, schedule, context, inputs)",
+            _BENCHMARK_SOURCE,
+        )
+        self.assertIn(
+            "*(getattr(context, name).clone() for name in FORWARD_CONTEXT_NAMES)",
+            _BENCHMARK_SOURCE,
+        )
+        self.assertIn(
+            "gradients = tuple(tensor.clone() for tensor in gradients)",
+            _BENCHMARK_SOURCE,
+        )
+        self.assertIn("and global_maximum <= atol", _BENCHMARK_SOURCE)
+        self.assertIn("and global_relative <= rtol", _BENCHMARK_SOURCE)
 
     def test_missing_host_num_tokens_mirror_keeps_legacy_fallback(self) -> None:
         scalar = self._DeviceScalar(768)

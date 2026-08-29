@@ -127,14 +127,20 @@ class PersistentBF16ContractTest(unittest.TestCase):
         # not.  Their indices match CUDA's full schedule-capacity arrays.
         hidden_zero = contract.ReadyKey(contract.HIDDEN_READY, 0, 0)
         hidden_eight = contract.ReadyKey(contract.HIDDEN_READY, 8, 0)
-        self.assertEqual(hidden_zero.counter_index, 0)
-        self.assertEqual(hidden_eight.counter_index, 8 * 16)
-        self.assertNotEqual(hidden_zero.counter_index, hidden_eight.counter_index)
+        self.assertEqual(hidden_zero.routed_counter_index, 0)
+        self.assertEqual(hidden_eight.routed_counter_index, 8 * 16)
+        self.assertNotEqual(
+            hidden_zero.routed_counter_index,
+            hidden_eight.routed_counter_index,
+        )
         y_done_zero = contract.ReadyKey(contract.Y_DONE, 0, 0)
         y_done_eight = contract.ReadyKey(contract.Y_DONE, 8, 0)
-        self.assertEqual(y_done_zero.counter_index, 0)
-        self.assertEqual(y_done_eight.counter_index, 8 * 32)
-        self.assertNotEqual(y_done_zero.counter_index, y_done_eight.counter_index)
+        self.assertEqual(y_done_zero.routed_counter_index, 0)
+        self.assertEqual(y_done_eight.routed_counter_index, 8 * 32)
+        self.assertNotEqual(
+            y_done_zero.routed_counter_index,
+            y_done_eight.routed_counter_index,
+        )
 
     def test_every_fc1_claim_precedes_the_first_down_claim(self) -> None:
         schedule = contract.reverse_minibatches(16 * 4096)
@@ -168,9 +174,9 @@ class PersistentBF16ContractTest(unittest.TestCase):
         self.assertEqual(
             down[16].waits,
             (
-                contract.ReadyKey(contract.HIDDEN_READY, 0, 1),
-                contract.ReadyKey(contract.Y_DONE, 8, 2),
-                contract.ReadyKey(contract.Y_DONE, 8, 3),
+                contract.ReadyKey(contract.HIDDEN_READY, 0, 2),
+                contract.ReadyKey(contract.Y_DONE, 8, 4),
+                contract.ReadyKey(contract.Y_DONE, 8, 5),
             ),
         )
         self.assertEqual(down[0].arrival, contract.ReadyKey(contract.Y_READY, 0))
@@ -208,7 +214,7 @@ class PersistentBF16ContractTest(unittest.TestCase):
         self.assertEqual(len(arrivals), 32)
         self.assertEqual(set(arrivals.values()), {32})
 
-    def test_partial_tail_uses_dynamic_counts_and_row_major_coordinates(self) -> None:
+    def test_partial_tail_uses_dynamic_counts_and_supergroup_coordinates(self) -> None:
         tail = contract.MiniBatch(252, 768)
         self.assertEqual(tail.dispatch_tasks, (768 // 128) * 8)
         self.assertEqual(tail.fc1_tasks, (768 // 256) * 8)
@@ -226,10 +232,14 @@ class PersistentBF16ContractTest(unittest.TestCase):
 
         schedule = contract.reverse_minibatches(1032960)
         down = contract.compute_claims(tail, schedule)[tail.fc1_tasks :]
-        self.assertEqual(contract.TASK_ORDER, "row_major_global_rows")
+        self.assertEqual(contract.TASK_ORDER, "expert_segment_supergroup8")
         self.assertEqual(
             [(claim.row_tile, claim.column_tile) for claim in down[:18]],
-            [(0, column) for column in range(16)] + [(1, 0), (1, 1)],
+            (
+                [(0, column) for column in range(8)]
+                + [(1, column) for column in range(8)]
+                + [(2, 0), (2, 1)]
+            ),
         )
 
         # Generation 244 reuses slot 4 after generation 252's 768-row tail.

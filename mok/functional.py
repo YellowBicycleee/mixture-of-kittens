@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+import sys
 from typing import Any, Literal
 
 import torch
@@ -50,7 +51,9 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor     # (schedule_capacity,) int32
     num_tokens: torch.Tensor         # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
-    num_tokens_host: int | None = None  # () optional host mirror for CuTe DSL
+    # Compatibility field for the retired host-wavefront CuTe path.  New
+    # schedules leave it unset so schedule construction stays asynchronous.
+    num_tokens_host: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +362,21 @@ def clear_workspace_cache() -> None:
         barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                     workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
         torch.cuda.synchronize(workspace.device)
+    # Do not import optional CuTe dependencies for CUDA-only users.  If the
+    # public persistent backend was used, release its executor-only cache after
+    # a conservative synchronization of the devices that compiled executors.
+    persistent_bf16 = sys.modules.get("mok.cutedsl.persistent_bf16")
+    if persistent_bf16 is not None:
+        clear_executor_cache = getattr(
+            persistent_bf16,
+            "clear_persistent_bf16_executor_cache",
+            None,
+        )
+        if clear_executor_cache is not None:
+            # The public A->B->A address-swap gate validates executor reuse
+            # across workspace lifetimes; synchronizing here keeps cache
+            # destruction conservative.
+            clear_executor_cache(synchronize=True)
     _WORKSPACE_CACHE.clear()
 
 
@@ -437,16 +455,9 @@ def build_schedule(
      num_tokens, tokens_per_expert) = schedule(
         workspace.all_gather_top_experts_buffer, num_local_experts,
         workspace.schedule_capacity, workspace.ep_rank)
-    # CuTe DSL launches one Python-level wavefront loop and needs the routed
-    # row count on the host. Pay this synchronization only for explicit CuTe
-    # schedules; CUDA schedule construction remains asynchronous.
-    num_tokens_host = (
-        int(num_tokens.item()) if config.fwd_backend == "cutedsl" else None
-    )
     return MoKSchedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
-        num_tokens_host=num_tokens_host,
     )
 
 
@@ -587,8 +598,12 @@ def forward(
             )
         else:
             # CUTLASS/QuACK stay optional and cannot affect CUDA imports. This
-            # explicit path is currently EP8 BF16 SM103 Qwen and unclamped only.
-            from .cutedsl.forward import forward_bf16 as cutedsl_forward_bf16
+            # lazy seam reaches only the accepted persistent specialization;
+            # unsupported configurations fail closed without an old-wavefront
+            # or CUDA fallback.
+            from .cutedsl.persistent_bf16 import (
+                forward_bf16 as cutedsl_forward_bf16,
+            )
 
             (x_routed, gate_shared, gate_routed, up_shared, up_routed,
              hidden_shared, hidden_routed, y_shared, y_routed) = cutedsl_forward_bf16(

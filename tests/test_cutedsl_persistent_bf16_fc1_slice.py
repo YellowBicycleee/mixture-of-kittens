@@ -30,7 +30,7 @@ class TestPersistentBf16Fc1Slice(unittest.TestCase):
         self.assertEqual(_HOST.FC1_TILE_K, 4096)
         self.assertEqual(_HOST.CLUSTER_SHAPE, (2, 1, 1))
         self.assertTrue(_HOST.FC1_SLICE_SOURCE_BODY_PRESENT)
-        self.assertFalse(_HOST.FULL_PERSISTENT_FORWARD_COMPLETE)
+        self.assertTrue(_HOST.FULL_PERSISTENT_FORWARD_COMPLETE)
         _HOST.Fc1SlicePlan().validate()
 
     def test_plan_rejects_generalization(self) -> None:
@@ -52,6 +52,21 @@ class TestPersistentBf16Fc1Slice(unittest.TestCase):
         self.assertNotIn("tma_multicast=", _GEMM_SOURCE)
         self.assertNotIn("packed_gate_up_weights", _GEMM_SOURCE)
 
+    def test_kernel_does_not_capture_a_local_python_collective(self) -> None:
+        tree = ast.parse(_GEMM_SOURCE)
+        kernel = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "kernel"
+        )
+        local_collective_names = [
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Name) and node.id == "collective"
+        ]
+        self.assertEqual(local_collective_names, [])
+        self.assertIn("self.collective.load_tma(", _GEMM_SOURCE)
+
     def test_mma_aware_tma_helpers_preserve_rest_k_mode(self) -> None:
         self.assertIn("cute.nvgpu.make_tiled_tma_atom_A(", _GEMM_SOURCE)
         self.assertEqual(
@@ -60,12 +75,80 @@ class TestPersistentBf16Fc1Slice(unittest.TestCase):
         )
         self.assertNotIn("cpasync.make_tiled_tma_atom(\n            tma_op", _GEMM_SOURCE)
 
+    def test_struct_extents_are_literal_for_supported_toolchain(self) -> None:
+        self.assertNotIn("from __future__ import annotations", _GEMM_SOURCE)
+        self.assertIn("AB_STAGES = 6", _GEMM_SOURCE)
+        self.assertIn("ACC_STAGES = 2", _GEMM_SOURCE)
+        self.assertIn("D_STAGES = 3", _GEMM_SOURCE)
+        self.assertIn("EPILOGUE_N = 32", _GEMM_SOURCE)
+        self.assertIn("K_TILE = 64", _GEMM_SOURCE)
+        self.assertIn(
+            "MemRange[cutlass.Int64, 12]", _GEMM_SOURCE
+        )
+        self.assertIn(
+            "MemRange[cutlass.Int64, 4]", _GEMM_SOURCE
+        )
+        self.assertIn(
+            "MemRange[cutlass.Uint8, 221184]", _GEMM_SOURCE
+        )
+        self.assertNotIn("2 * AB_STAGES", _GEMM_SOURCE)
+        self.assertNotIn("2 * ACC_STAGES", _GEMM_SOURCE)
+
+    def test_supported_toolchain_uses_the_stable_block_copy_api(self) -> None:
+        self.assertIn("def _make_tma_block_load_fn(", _GEMM_SOURCE)
+        self.assertIn("block_copy(", _GEMM_SOURCE)
+        self.assertEqual(_GEMM_SOURCE.count("_make_tma_block_load_fn("), 4)
+        self.assertNotIn("quack_copy_utils", _GEMM_SOURCE)
+        tree = ast.parse(_GEMM_SOURCE)
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_make_tma_block_load_fn"
+        )
+        self.assertFalse(
+            any(isinstance(node, ast.With) for node in ast.walk(helper))
+        )
+
+    def test_quack_064_pipeline_owns_the_accumulator_release_election(self) -> None:
+        self.assertIn("QuACK 0.6.x delegates", _GEMM_SOURCE)
+        self.assertEqual(_GEMM_SOURCE.count("elect_one_release=True"), 1)
+        self.assertEqual(_GEMM_SOURCE.count("syncwarp_before_release=False"), 1)
+
     def test_device_body_reaches_bf16_smem_and_gmem_handoff(self) -> None:
         self.assertIn("collective.mma(", _GEMM_SOURCE)
         self.assertIn("epilog_tmem_copy_and_partition", _GEMM_SOURCE)
-        self.assertIn("rD_bf16 = tRS_rD.to(BFloat16)", _GEMM_SOURCE)
+        self.assertIn(
+            "rD_bf16 = cute.make_rmem_tensor_like(tRS_rD, BFloat16)",
+            _GEMM_SOURCE,
+        )
+        self.assertIn(
+            "rD_bf16.store(tRS_rD.load().to(BFloat16))",
+            _GEMM_SOURCE,
+        )
+        self.assertNotIn("tRS_rD.to(BFloat16)", _GEMM_SOURCE)
         self.assertIn("copy_D(src_idx=epi_buffer, dst_idx=epi_coord)", _GEMM_SOURCE)
         self.assertNotIn("raise NotImplementedError", _GEMM_SOURCE)
+
+    def test_supported_toolchain_converts_loaded_values_not_tensor_objects(self) -> None:
+        tree = ast.parse(_GEMM_SOURCE)
+        bf16_to_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "BFloat16"
+        ]
+        self.assertEqual(len(bf16_to_calls), 1)
+        receiver = bf16_to_calls[0].func.value
+        self.assertIsInstance(receiver, ast.Call)
+        self.assertIsInstance(receiver.func, ast.Attribute)
+        self.assertEqual(receiver.func.attr, "load")
+        self.assertIsInstance(receiver.func.value, ast.Name)
+        self.assertEqual(receiver.func.value.id, "tRS_rD")
 
     def test_compile_slice_is_private_and_has_no_fallback(self) -> None:
         tree = ast.parse(_GEMM_SOURCE)
