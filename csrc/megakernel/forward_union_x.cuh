@@ -86,10 +86,10 @@ struct globals_union_x_fwd {
 };
 
 // Keep Dispatch/readiness at the configured minibatch granularity, but order
-// routed compute in stage-major windows of up to 16K rows.  This preserves all
+// routed compute in stage-major windows of up to 32K rows.  This preserves all
 // task identities and dependency counts while avoiding a Gate/Down role switch
 // after every 4K communication minibatch.
-static constexpr int UNION_X_COMPUTE_GROUP_ROWS = 16384;
+static constexpr int UNION_X_COMPUTE_GROUP_ROWS = 32768;
 
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_union_x_kernel(

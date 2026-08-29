@@ -167,23 +167,23 @@ def test_qwen_mini4_task_set_and_switch_count() -> None:
         full_macrobatch_minis=8,
         gate_tasks=64,
         down_tasks=256,
-        group_minis=4,
+        group_minis=8,
     )
     legacy_switches = 2 * 252 - 1
-    grouped_switches = 2 * 63 - 1
+    grouped_switches = 2 * 32 - 1
     assert legacy_switches == 503
-    assert grouped_switches == 125
+    assert grouped_switches == 63
 
 
-def test_mini16_is_unchanged() -> None:
-    legacy = legacy_tasks(32, 1, 2, 256, 1024)
-    grouped = list(grouped_tasks(32, 1, 2, 256, 1024, 1))
+def test_mini32_is_unchanged() -> None:
+    legacy = legacy_tasks(32, 1, 1, 512, 2048)
+    grouped = list(grouped_tasks(32, 1, 1, 512, 2048, 1))
     assert grouped == legacy
 
 
 def test_all_256_row_macro_tails_preserve_dependencies() -> None:
-    # macro32K/minibatch256 has 128 possible nonempty tail lengths.  A 16K
-    # compute window groups 64 communication minibatches without crossing the
+    # macro32K/minibatch256 has 128 possible nonempty tail lengths.  A 32K
+    # compute window groups 128 communication minibatches without crossing the
     # macro boundary.
     for last_minis in range(1, 129):
         assert_mapping(
@@ -192,13 +192,13 @@ def test_all_256_row_macro_tails_preserve_dependencies() -> None:
             full_macrobatch_minis=128,
             gate_tasks=4,
             down_tasks=16,
-            group_minis=64,
+            group_minis=128,
         )
 
 
 def test_source_keeps_task_counts_and_changes_only_decode_order() -> None:
     for token in (
-        "UNION_X_COMPUTE_GROUP_ROWS = 16384",
+        "UNION_X_COMPUTE_GROUP_ROWS = 32768",
         "const int routed_task_order = compute_cluster_idx - shared_tasks",
         "last_macrobatch_num_minibatches * minibatch_tasks",
         "group_num_minibatches * minibatch_routed_gate_up_tasks",
